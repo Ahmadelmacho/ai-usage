@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# fd capture swaps the stdout/stderr handles between tests; Tcl keeps the closed ones and a later tk.Tk() fails
+addopts = "--capture=sys"

@@ -1,0 +1,56 @@
+# Push a tag like v1.0.1 (matching usage_tray/__init__.py) to test, build and publish AIUsage.zip as a release.
+# get.ps1 installs the latest release, and the app offers it as "Update to v1.0.1".
+# Tags with a "-" (v1.1.0-beta) do not run: the app cannot read them, and they would publish as "latest".
+name: release
+on:
+  push:
+    tags: ['v*', '!v*-*']
+permissions: {}
+jobs:
+  build:  # runs the third-party code (pip, tests, PyInstaller), so it gets a read-only token
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Set up .venv (build.ps1 uses .venv)
+        run: |
+          py -3.13 -m venv .venv
+          .venv\Scripts\python -m pip install --require-hashes --only-binary :all: -r requirements.lock
+          if ($LASTEXITCODE) { throw 'pip install failed' }
+      - name: Tag must be vX.Y.Z and match __version__
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v\d+(\.\d+)*$') { throw "tag $env:GITHUB_REF_NAME is not vX.Y.Z" }
+          $v = .venv\Scripts\python -c "import usage_tray; print(usage_tray.__version__)"
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "tag $env:GITHUB_REF_NAME but usage_tray/__init__.py says $v" }
+      - name: Tests
+        run: |
+          .venv\Scripts\python -m pytest -q
+          if ($LASTEXITCODE) { throw 'tests failed' }
+      - name: Build and pack
+        run: |
+          .\build.ps1
+          .\pack.ps1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: AIUsage
+          path: dist/AIUsage.zip
+          if-no-files-found: error
+  publish:  # runs no repo code; the only job that can write releases
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # gh release create
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: AIUsage
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" AIUsage.zip --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
