@@ -28,11 +28,13 @@ The app looks for a new release a minute after it starts and every 6 hours after
 - Orange number: Claude's weekly % left. White number: Codex's 5-hour % left, or the weekly one if your plan has no 5-hour limit. Both turn amber at 25% and red at 10%.
 - Hover a number for reset times. Click it to open the window. Right-click for Check for updates, Refresh, Open and Close.
 - It checks every 5 seconds. When a check fails, it keeps showing the last good numbers and tries again a little later.
+- Free resets: when Claude or Codex gives you free limit resets, the window shows how many you have, of which kind, and when the first one expires. Each kind has a **Use a reset** link. It asks "Are you sure?" first, because a used reset can't be given back.
 
 ## What it reads
 
-- It never reads a login token. It never opens `~/.claude/.credentials.json`, and for `~/.codex/auth.json` it looks only at the time the file changed, to notice a new login.
-- From `~/.claude.json` it reads two values: your account id and the usage numbers Claude saved.
+- For free resets only, it reads your Claude login key: the `claudeAiOauth.accessToken` value in `~/.claude/.credentials.json` (or in your `CLAUDE_CONFIG_DIR`). It reads the file only when it makes one of the two reset calls below. It sends the key only to `https://api.anthropic.com`, with Windows' certificate check on. It never saves, logs or refreshes the key, and never writes the file. If the key is missing or expired, the app shows no Claude resets.
+- For `~/.codex/auth.json` it looks only at the time the file changed, to notice a new login.
+- From `~/.claude.json` it reads three values: your account id, your organization id (for a Claude reset) and the usage numbers Claude saved.
 - It sends no prompts, so it spends no tokens.
 - It keeps the last numbers and a log in `%LOCALAPPDATA%\AIUsage`. The log can hold error text from the CLIs, so read it before you share it.
 
@@ -42,6 +44,8 @@ It asks your own signed-in `claude` and `codex` programs, the same way [T3 Code]
 
 - Claude: `claude -p --input-format stream-json`, then the control request `get_usage`. Anthropic doesn't document this request, so a Claude Code update can break it.
 - Codex: `codex app-server`, then the documented method `account/rateLimits/read`.
+- Claude free resets: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, at most every 5 minutes. **Use a reset** sends `POST /api/organizations/<your org>/reset_rate_limits`. Anthropic doesn't document these calls either.
+- Codex free resets come in the `account/rateLimits/read` answer. **Use a reset** sends `account/rateLimitResetCredit/consume`.
 
 Both programs stay running between checks, with plugins and auto-updates off. The app restarts them every 30 minutes, after a failed check, and when you switch accounts. When the app quits, they quit too.
 

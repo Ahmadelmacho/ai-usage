@@ -41,3 +41,46 @@ print('tooltips:')
 for name, prov in (('Claude Code', 'claude'), ('Codex', 'codex')):
     t = L.tooltip(name, states[prov], now)
     print(f'--- {len(t)} chars\n{t}')
+# free resets (made up): 2 Claude kinds and 1 Codex, in both themes; then the note after a spend
+res = {'codex': L.ProviderState(codex, now - 120, resets=[L.Reset('codex', 'codex', 'Codex reset', '', 1, now + 86400 * 3)]),
+       'claude': L.ProviderState(claude, now - 120, resets=[
+           L.Reset('claude', 'weekly', 'Weekly reset', '', 1, now + 86400 * 8, 'g1'),
+           L.Reset('claude', 'full', 'Full reset', '', 1, None, 'g2')])}
+hover = {'check': 1, 'settings': 1, 'use:claude:full': 1, 'refresh': 1, 'refresh!': 1, 'spin': 60}  # hover, press, spin
+for light in (False, True):
+    draw.use_palette(light)
+    draw.render_window(res, now, 760, 1.0)[0].save(os.path.join(out, f'window_resets_{"light" if light else "dark"}.png'))
+    draw.render_window(res, now, 760, 1.0, check='Check for updates', fx=hover)[0].save(
+        os.path.join(out, f'window_hover_{"light" if light else "dark"}.png'))
+draw.use_palette(False)
+draw.render_window(res, now, 760, 1.0, notes={'claude': 'Reset used'})[0].save(os.path.join(out, 'window_resets_note.png'))
+print('tooltip with resets:', L.tooltip('Claude Code', res['claude'], now).split('\n')[:2])
+# the window in the Light theme, and the Settings window (a real Tk window, screenshotted) in both themes
+draw.use_palette(True)
+draw.render_window(states, now, 760, 1.0)[0].save(os.path.join(out, 'window_light.png'))
+import tkinter as tk  # noqa: E402
+from PIL import ImageGrab  # noqa: E402
+from usage_tray import app as A, settings as S  # noqa: E402
+import ctypes  # noqa: E402
+ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # screen pixels = Tk pixels
+root = tk.Tk()
+root.withdraw()
+for light in (False, True):
+    draw.use_palette(light)
+    fake = type('Fake', (), {'prefs': {**S.DEFAULTS, 'theme': 'light' if light else 'dark'}, 'light': light, 'settings_win': tk.Toplevel(root),
+                             'settings_open': lambda self: True, 'title_bar': A.App.title_bar,
+                             'hoverable': lambda self, *a: None})()
+    fake.settings_win.geometry('+200+200')
+    fake.settings_win.title('AI Usage settings')
+    fake.settings_win.attributes('-topmost', True)
+    A.App.fill_settings(fake)
+    fake.settings_win.update()
+    fake.settings_win.after(400)
+    fake.settings_win.update()
+    w = fake.settings_win
+    ImageGrab.grab((w.winfo_rootx(), w.winfo_rooty() - 31, w.winfo_rootx() + w.winfo_width(),
+                    w.winfo_rooty() + w.winfo_height()), all_screens=True).save(
+        os.path.join(out, f'settings_{"light" if light else "dark"}.png'))
+    w.destroy()
+root.destroy()
+draw.use_palette(False)

@@ -1,10 +1,12 @@
 import ctypes
+import io
 import json
 import os
 import sys
 import textwrap
 import threading
 import time
+import urllib.error
 
 import pytest
 
@@ -495,3 +497,309 @@ def test_cli_lookup_skips_current_folder(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(L.ProbeError, match='Claude Code not found'):
         L._claude_exe()
+
+
+# ---------- free resets ----------
+
+def test_codex_resets_none_or_null():
+    assert L.parse_codex_resets(fixture('codex_ratelimits.json')) == []
+    assert L.parse_codex_resets({'rateLimitResetCredits': None}) == []
+    assert L.parse_codex_resets({'rateLimitResetCredits': {'availableCount': 0, 'credits': []}}) == []
+    assert L.parse_codex_resets(None) == []
+
+
+def test_codex_resets_null_credits_still_count():
+    [r] = L.parse_codex_resets({'rateLimitResetCredits': {'availableCount': 2, 'credits': None}})
+    assert (r.provider, r.kind, r.label, r.count, r.expires_at, r.credit_id) == ('codex', 'codex', 'Codex reset', 2, None, None)
+
+
+def test_codex_resets_mix_takes_first_available_expiry():
+    credits = [
+        {'id': 'a', 'status': 'redeemed', 'expiresAt': NOW + 10, 'title': 'Old'},
+        {'id': 'b', 'status': 'available', 'expiresAt': NOW + 900, 'title': 'Weekly refill', 'description': 'Refills it.'},
+        {'id': 'c', 'status': 'available', 'expiresAt': NOW + 500},
+        {'id': 'd', 'status': 'redeeming', 'expiresAt': NOW + 1},
+        {'id': 'e', 'status': 'available', 'expiresAt': None},
+    ]
+    [r] = L.parse_codex_resets({'rateLimitResetCredits': {'availableCount': 3, 'credits': credits}})
+    assert (r.label, r.description, r.count, r.expires_at) == ('Weekly refill', 'Refills it.', 3, NOW + 500)
+
+
+def grant(id='g1', left=1, **kw):
+    return {'id': id, 'resets_left': left, 'paused': False, 'usable_now': True, 'ends_at': None, **kw}
+
+
+def block(*grants, next_id='g1', eligible=True):
+    return {'eligible': eligible, 'grants': list(grants), 'next_grant_id': next_id}
+
+
+@pytest.mark.parametrize('b', [None, {}, block(grant(), eligible=False), block(grant(), next_id=None),
+                               block(grant(paused=True)), block(grant(usable_now=False)),
+                               block(grant(ends_at='2020-01-01T00:00:00Z')), block(grant(ends_at='2030-01-01')),
+                               block(grant(left=0)), block(grant(id='Bad ID!')), block(grant(left=True))])
+def test_claude_resets_none(b):
+    assert L.parse_claude_resets(b, NOW) == []
+
+
+def test_claude_resets_several_kinds():
+    b = block(grant('g1', 1, type='weekly', ends_at='2030-01-01T00:00:00Z'),
+              grant('g2', 2, clears=['five_hour', 'seven_day'], ends_at='2027-02-01T00:00:00.5+00:00'),
+              grant('g9', 1, type='full', ends_at='2027-01-31T00:00:00.5+00:00'),
+              grant('g3', 1, clears=['seven_day']),
+              grant('g4', 1, gives_back_weekly=True, type='weekly'),
+              grant('g5', 1, clears=['five_hour']),
+              grant('g6', 5, paused=True, type='full'), grant('g7', 5, usable_now=False, type='full'),
+              grant('g8', 5, type='full', ends_at='2026-01-01T00:00:00Z'))
+    rs = L.parse_claude_resets(b, NOW)
+    assert [(r.kind, r.label, r.count, r.credit_id) for r in rs] == [
+        ('session', '5-hour reset', 1, 'g5'), ('weekly', 'Weekly reset', 2, 'g1'),
+        ('fable', 'Fable reset', 1, 'g4'), ('full', 'Full reset', 3, 'g2')]
+    assert rs[1].expires_at == pytest.approx(1893456000.0) and rs[0].expires_at is None
+    assert rs[3].expires_at == pytest.approx(1801353600.5)  # the soonest of its kind, not the first listed
+    assert rs[3].description == 'Refills your 5-hour and weekly limits.'
+
+
+def test_resets_line_and_tooltip():
+    rs = [L.Reset('claude', 'weekly', 'Weekly reset', '', 1, 1_900_000_000.0),
+          L.Reset('claude', 'full', 'Full reset', '', 1, NOW - 5)]
+    line = L.resets_line(rs, NOW)
+    assert line.startswith('Free resets: 2 · Weekly reset ×1, Full reset ×1 · first expires ')
+    assert L.resets_line([], NOW) is None
+    st = L.ProviderState([row(5, 60)], NOW, resets=rs)
+    assert L.tooltip('Claude Code', st, NOW).split('\n')[1] == '2 free resets'
+    assert 'free reset' not in L.tooltip('Claude Code', L.ProviderState([row(5, 60)], NOW), NOW)
+
+
+def test_state_with_resets_round_trips_and_old_files_load():
+    rs = [L.Reset('claude', 'full', 'Full reset', 'Refills.', 2, NOW + 5, 'g2'), L.Reset('codex', 'codex', 'Codex reset', 'x', 1)]
+    st = L.ProviderState([row(5, 60)], NOW, resets=rs)
+    assert L.ProviderState.from_json(json.loads(json.dumps(st.to_json()))).resets == rs
+    old = {'rows': [{'key': 'k', 'label': 'Weekly', 'used': 5, 'resets_at': None, 'window_mins': None}], 'checked_at': NOW}
+    assert L.ProviderState.from_json(old).resets == []
+    bad = dict(st.to_json(), resets=[{'provider': 'claude', 'kind': 'full', 'label': 'x', 'description': 'y', 'count': 0}])
+    with pytest.raises(TypeError):
+        L.ProviderState.from_json(bad)
+
+
+# Claude's reset calls, with a fake Anthropic. The token below is fake; tests check it never leaks.
+TOKEN = 'sk-ant-oat01-FAKE-TOKEN-must-not-leak'
+
+
+class FakeResp(io.BytesIO):
+    def __init__(self, status, raw):
+        super().__init__(raw)
+        self.status = status
+
+
+class FakeAnthropic:
+    def __init__(self, *answers):
+        self.answers, self.seen = list(answers), []
+
+    def __call__(self, req, timeout):
+        self.seen.append((req.get_method(), req.full_url, dict(req.header_items()), req.data, timeout))
+        a = self.answers.pop(0)
+        if isinstance(a, BaseException):
+            raise a
+        status, body = a
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, 'nope', {}, io.BytesIO(json.dumps(body or {}).encode()))
+        return FakeResp(status, json.dumps(body).encode())
+
+
+@pytest.fixture
+def claude_home(tmp_path, monkeypatch):
+    (tmp_path / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {'accessToken': TOKEN}}), encoding='utf-8')
+    (tmp_path / '.claude.json').write_text(json.dumps({'oauthAccount': {'organizationUuid': 'org-1'}}), encoding='utf-8')
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path))
+    monkeypatch.setattr(L, '_version', '2.1.0')
+    monkeypatch.setattr(L, '_claude_resets', {'at': None, 'value': [], 'account': None, 'lock': threading.Lock()})
+    return tmp_path
+
+
+def use_http(monkeypatch, *answers):
+    f = FakeAnthropic(*answers)
+    monkeypatch.setattr(L, '_urlopen', f)
+    return f
+
+
+def usage_body(*grants):
+    return {'five_hour': None, 'cedar_ember': block(*grants)}
+
+
+def test_claude_read_200_sends_t3s_request(claude_home, monkeypatch):
+    http = use_http(monkeypatch, (200, usage_body(grant('g1', 2, type='weekly'))))
+    [r] = L.claude_resets(NOW)
+    assert (r.kind, r.count) == ('weekly', 2)
+    method, url, headers, data, timeout = http.seen[0]
+    assert (method, url, data, timeout) == ('GET', 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1', None, 10)
+    assert headers['Authorization'] == f'Bearer {TOKEN}' and headers['Anthropic-beta'] == 'oauth-2025-04-20'
+    assert headers['User-agent'] == 'claude-cli/2.1.0 (external, cli)'
+
+
+def test_claude_read_asks_at_most_every_5_minutes(claude_home, monkeypatch):
+    http = use_http(monkeypatch, (200, usage_body(grant())), (200, usage_body()), (200, usage_body()))
+    assert len(L.claude_resets(NOW)) == 1
+    assert len(L.claude_resets(NOW + 299)) == 1 and len(http.seen) == 1
+    assert L.claude_resets(NOW + 300) == [] and len(http.seen) == 2
+    L.claude_resets(NOW + 301, force=True)
+    assert len(http.seen) == 3
+
+
+@pytest.mark.parametrize('status', [401, 403])
+def test_claude_read_signed_out_shows_none(claude_home, monkeypatch, status):
+    use_http(monkeypatch, (200, usage_body(grant())), (status, None))
+    assert L.claude_resets(NOW)
+    assert L.claude_resets(NOW + 400) == []
+
+
+@pytest.mark.parametrize('failure', [(429, None), (500, None), TimeoutError('timed out'),
+                                     urllib.error.URLError(TimeoutError()), OSError('reset')])
+def test_claude_read_429_or_failure_keeps_last(claude_home, monkeypatch, failure):
+    use_http(monkeypatch, (200, usage_body(grant())), failure)
+    first = L.claude_resets(NOW)
+    assert first and L.claude_resets(NOW + 400) == first
+
+
+def test_claude_read_missing_token_or_version_asks_nothing(claude_home, monkeypatch):
+    http = use_http(monkeypatch)
+    (claude_home / '.credentials.json').unlink()
+    assert L.claude_resets(NOW) == []
+    (claude_home / '.credentials.json').write_text('{"claudeAiOauth": {"accessToken": "  "}}', encoding='utf-8')
+    assert L.claude_resets(NOW, force=True) == []
+    (claude_home / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {'accessToken': TOKEN}}), encoding='utf-8')
+    monkeypatch.setattr(L, '_version', '')
+    assert L.claude_resets(NOW, force=True) == [] and http.seen == []
+
+
+def test_claude_call_refuses_other_addresses(claude_home, monkeypatch):
+    http = use_http(monkeypatch)
+    with pytest.raises(L.ProbeError):
+        L._claude_call('GET', 'https://api.anthropic.com.evil.example/x', None, 10)
+    assert http.seen == []
+
+
+@pytest.mark.parametrize('result, outcome', [('reset', 'reset'), ('not_limited', 'nothing'), ('already_used', 'already'),
+                                             ('ineligible', 'no_credit'), ('cooldown', 'cooldown'),
+                                             ('unavailable', 'unconfirmed'), ('surprise', 'failed')])
+def test_claude_spend_outcomes(claude_home, monkeypatch, result, outcome):
+    http = use_http(monkeypatch, (200, {'result': result}))
+    assert L.use_claude_reset('g1', 'req_1') == outcome
+    method, url, headers, data, timeout = http.seen[0]
+    assert (method, url, timeout) == ('POST', 'https://api.anthropic.com/api/organizations/org-1/reset_rate_limits', 25)
+    assert json.loads(data) == {'program': 'cedar_ember', 'grant_id': 'g1', 'request_id': 'req_1'}
+    assert headers['Authorization'] == f'Bearer {TOKEN}'
+
+
+@pytest.mark.parametrize('answer, outcome', [((429, None), 'rate_limited'), ((401, None), 'signed_out'),
+                                             ((403, None), 'signed_out'), ((500, None), 'failed'),
+                                             ((404, None), 'refused'), ((400, {'error': 'x'}), 'refused'),
+                                             ((409, None), 'failed'),
+                                             (TimeoutError('timed out'), 'failed')])
+def test_claude_spend_http_failures(claude_home, monkeypatch, answer, outcome):
+    use_http(monkeypatch, answer)
+    assert L.use_claude_reset('g1', 'req_1') == outcome
+
+
+def test_claude_spend_checks_ids_and_login_before_sending(claude_home, monkeypatch):
+    http = use_http(monkeypatch)
+    assert L.use_claude_reset('Bad Grant', 'req_1') == 'failed'
+    assert L.use_claude_reset('g1', 'bad id!') == 'failed'
+    assert L.use_claude_reset(None, 'req_1') == 'failed'
+    (claude_home / '.claude.json').write_text('{"oauthAccount": {}}', encoding='utf-8')
+    assert L.use_claude_reset('g1', 'req_1') == 'signed_out'
+    (claude_home / '.claude.json').write_text(json.dumps({'oauthAccount': {'organizationUuid': 'org-1'}}), encoding='utf-8')
+    (claude_home / '.credentials.json').unlink()
+    assert L.use_claude_reset('g1', 'req_1') == 'signed_out' and http.seen == []
+
+
+def test_use_reset_claude_asks_again_after(claude_home, monkeypatch):
+    http = use_http(monkeypatch, (200, {'result': 'reset'}), (200, usage_body()))
+    L._claude_resets['at'] = time.time()  # a fresh answer would normally hold off the next read
+    assert L.use_reset(L.Reset('claude', 'full', 'Full reset', '', 1, None, 'g1')) == 'reset'
+    assert [s[0] for s in http.seen] == ['POST', 'GET'] and L._claude_resets['value'] == []
+
+
+def test_token_never_in_logs_or_errors(claude_home, monkeypatch, caplog):
+    caplog.set_level('DEBUG')
+
+    class Leaky(Exception):
+        pass
+    for boom in (Leaky(f'failed with header Bearer {TOKEN}'), TimeoutError(TOKEN), OSError(TOKEN)):
+        use_http(monkeypatch, boom)
+        with pytest.raises(L.ProbeError) as e:
+            L._claude_call('GET', L.CLAUDE_USAGE_URL, None, 10)
+        assert TOKEN not in str(e.value) and e.value.__cause__ is None and e.value.__suppress_context__
+        use_http(monkeypatch, boom, boom)
+        L.claude_resets(NOW, force=True)
+        assert L.use_claude_reset('g1', 'req_1') == 'failed'
+    for answer in ((401, None), (429, None), (500, None), (200, {'result': 'reset'})):
+        use_http(monkeypatch, answer, answer)
+        L.claude_resets(NOW, force=True)
+        L.use_claude_reset('g1', 'req_1')
+    assert caplog.records and TOKEN not in caplog.text
+
+
+class FakeCodex:
+    def __init__(self, answer):
+        self.answer, self.sent = answer, []
+
+    def ask(self, build):
+        msg, match = build(7)
+        self.sent.append(msg)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        kind, value = match(self.answer)
+        if kind == 'error':
+            raise L.ProbeError(value)
+        return value
+
+
+@pytest.mark.parametrize('outcome, ours', [('reset', 'reset'), ('nothingToReset', 'nothing'), ('noCredit', 'no_credit'),
+                                           ('alreadyRedeemed', 'already'), ('weird', 'failed')])
+def test_codex_spend_outcomes(monkeypatch, outcome, ours):
+    fake_codex = FakeCodex({'id': 7, 'result': {'outcome': outcome}})
+    monkeypatch.setattr(L, 'CODEX', fake_codex)
+    assert L.use_codex_reset('key-1') == ours
+    assert fake_codex.sent == [{'jsonrpc': '2.0', 'id': 7, 'method': 'account/rateLimitResetCredit/consume',
+                                'params': {'idempotencyKey': 'key-1'}}]
+
+
+@pytest.mark.parametrize('answer', [{'id': 7, 'error': {'message': 'no'}}, L.ProbeError('no answer in 25 s')])
+def test_codex_spend_failures(monkeypatch, answer):
+    fake_codex = FakeCodex(answer)
+    monkeypatch.setattr(L, 'CODEX', fake_codex)
+    assert L.use_codex_reset('key-1', 'cr_1') == 'failed'
+    assert fake_codex.sent[0]['params'] == {'idempotencyKey': 'key-1', 'creditId': 'cr_1'}
+
+
+def test_use_reset_codex_makes_a_key(monkeypatch):
+    fake_codex = FakeCodex({'id': 7, 'result': {'outcome': 'reset'}})
+    monkeypatch.setattr(L, 'CODEX', fake_codex)
+    assert L.use_reset(L.Reset('codex', 'codex', 'Codex reset', '', 1)) == 'reset'
+    assert len(fake_codex.sent[0]['params']['idempotencyKey']) == 32
+
+
+def test_real_spend_paths_are_guarded(monkeypatch):
+    """tests/conftest.py puts a guard on both real spend paths for every test, and a test's undo() keeps it."""
+    monkeypatch.setattr(L, 'CLAUDE_READ_SECS', 1)
+    monkeypatch.undo()
+    assert L._urlopen.__name__ == 'guarded_open' and L.Session._send.__name__ == 'guarded_send'
+
+
+def test_claude_resets_forget_the_last_account(claude_home, monkeypatch):
+    def sign_in(uuid):
+        (claude_home / '.claude.json').write_text(json.dumps({'oauthAccount': {'organizationUuid': 'org-1',
+                                                                               'accountUuid': uuid}}), encoding='utf-8')
+    sign_in('a')
+    http = use_http(monkeypatch, (200, usage_body(grant())), (429, None))
+    assert L.claude_resets(NOW)
+    sign_in('b')  # another account, a minute later: asked at once, and the old resets aren't shown meanwhile
+    assert L.claude_resets(NOW + 60) == [] and len(http.seen) == 2
+
+
+def test_used_claude_reset_leaves_the_cache_even_when_asking_again_fails(claude_home, monkeypatch):
+    use_http(monkeypatch, (200, usage_body(grant('g1', 2, type='weekly'))), (200, {'result': 'reset'}), (429, None))
+    assert [r.count for r in L.claude_resets(NOW)] == [2]
+    assert L.use_reset(L.Reset('claude', 'weekly', 'Weekly reset', '', 2, None, 'g1'), 'req_1') == 'reset'
+    assert [r.count for r in L._claude_resets['value']] == [1]
+    assert L.without_one(L._claude_resets['value'], 'weekly') == []

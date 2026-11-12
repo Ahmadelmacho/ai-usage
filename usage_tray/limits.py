@@ -2,7 +2,8 @@
 
 Claude: `claude -p` in stream-json mode with no prompt, control request `get_usage` (no model call, no tokens).
 Codex:  `codex app-server`, JSON-RPC `account/rateLimits/read`.
-Both CLIs refresh their own logins, so this app never touches a token.
+Both CLIs refresh their own logins. The one exception is Claude's free resets (Anthropic's own usage call, like
+T3): the Claude login token is read only for those two calls, never saved, logged or refreshed.
 """
 import ctypes
 import json
@@ -10,10 +11,15 @@ import logging
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -42,9 +48,11 @@ class ProviderState:
     rows: list[Row] = field(default_factory=list)
     checked_at: float | None = None  # last successful check
     error: str | None = None  # last attempt's failure, None when it worked
+    resets: list['Reset'] = field(default_factory=list)
 
     def to_json(self):
-        return {'rows': [asdict(r) for r in self.rows], 'checked_at': self.checked_at}
+        return {'rows': [asdict(r) for r in self.rows], 'checked_at': self.checked_at,
+                'resets': [asdict(r) for r in self.resets]}
 
     @classmethod
     def from_json(cls, d):
@@ -60,7 +68,29 @@ class ProviderState:
         checked = d.get('checked_at')
         if checked is not None and _num(checked) is None:
             raise TypeError('bad cached time')
-        return cls(rows=rows, checked_at=checked)
+        resets = []
+        for r in d.get('resets') or []:  # files from before free resets have none
+            count, exp = r['count'], r.get('expires_at')
+            if (not all(isinstance(r.get(k), str) for k in ('provider', 'kind', 'label', 'description'))
+                    or not isinstance(count, int) or isinstance(count, bool) or count < 1
+                    or (exp is not None and _num(exp) is None)
+                    or not (r.get('credit_id') is None or isinstance(r['credit_id'], str))):
+                raise TypeError('bad cached reset')
+            resets.append(Reset(r['provider'], r['kind'], r['label'], r['description'], count,
+                                None if exp is None else float(exp), r.get('credit_id')))
+        return cls(rows=rows, checked_at=checked, resets=resets)
+
+
+@dataclass
+class Reset:
+    """One kind of free reset the person can spend, with how many of it are left."""
+    provider: str  # 'claude' or 'codex'
+    kind: str  # Claude: session/weekly/fable/full; Codex: codex
+    label: str
+    description: str
+    count: int
+    expires_at: float | None = None  # epoch seconds of the first one to expire
+    credit_id: str | None = None  # Claude: the grant to spend; Codex: None (Codex picks one, like T3)
 
 
 # ---------- parsing ----------
@@ -601,6 +631,9 @@ def tooltip(name, state, now):
     else:
         head = f'{name} · checking…'
     lines = [head]
+    n = sum(r.count for r in state.resets)
+    if n:
+        lines.append(f"{n} free reset{'s' if n > 1 else ''}")
     for r in state.rows:
         cd = countdown(r, now)
         lines.append(f'{r.label}  {left_pct(r, now)}% left' + (f' · {cd}' if cd else ''))
@@ -610,3 +643,295 @@ def tooltip(name, state, now):
     while _utf16_len(text) > TIP_MAX - 1:  # drop whole characters, never half of an emoji's pair
         text = text[:-1]
     return text + '…'
+
+
+# ---------- free resets ----------
+# Codex: the rateLimits/read answer carries them; spending one is the JSON-RPC consume call.
+# Claude: Anthropic's own usage call (cedar_ember), the same one T3 makes. It needs Claude's login token, so the
+# token rules are strict: read only for these two calls, held in a local, sent only to api.anthropic.com with
+# Windows' certificate check and no redirects, never logged, saved, put in an error, or refreshed.
+
+ANTHROPIC = 'https://api.anthropic.com'
+CLAUDE_USAGE_URL = ANTHROPIC + '/api/oauth/usage?cedar_ember=1&skip_spend=1'
+CLAUDE_READ_SECS = 300  # ask Anthropic at most every 5 minutes (plus Refresh and right after a spend)
+_GRANT_ID = re.compile(r'[a-z0-9_-]{1,40}')
+_REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+_FULL_TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})')
+CLAUDE_KINDS = {  # T3's labels and one-line descriptions, in T3's order
+    'session': ('5-hour reset', 'Refills your 5-hour limit.'),
+    'weekly': ('Weekly reset', 'Refills your weekly limit.'),
+    'fable': ('Fable reset', "Refills your Fable allowance and gives back what Fable used on your weekly limit. "
+                             "It doesn't reset your whole week."),
+    'full': ('Full reset', 'Refills your 5-hour and weekly limits.'),
+}
+OUTCOMES = {  # what a spend returns -> plain words for the window
+    'reset': 'Reset used',
+    'nothing': 'Nothing to reset right now',
+    'no_credit': 'No resets left',
+    'already': 'That reset was already used',
+    'cooldown': 'Claude is cooling down, try later',
+    'rate_limited': 'Claude is cooling down, try later',
+    'signed_out': 'Signed out',
+    'unconfirmed': "Couldn't confirm the reset. Refresh to check",
+    'refused': "That reset can't be used now. Refresh to check",
+    'failed': "Couldn't use the reset. Try again later",
+}
+
+
+def parse_codex_resets(result):
+    """Free resets in an account/rateLimits/read result (T3's codexResetCreditsToContract)."""
+    summary = result.get('rateLimitResetCredits') if isinstance(result, dict) else None
+    if not isinstance(summary, dict):
+        return []
+    count = summary.get('availableCount')
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        return []
+    available = [c for c in summary.get('credits') or [] if isinstance(c, dict) and c.get('status') == 'available']
+    expiries = [e for e in (_num(c.get('expiresAt')) for c in available) if e is not None]
+    first = available[0] if available else {}
+    title, desc = first.get('title'), first.get('description')
+    return [Reset('codex', 'codex', title.strip() if isinstance(title, str) and title.strip() else 'Codex reset',
+                  desc.strip() if isinstance(desc, str) and desc.strip() else 'Refills your Codex limits.',
+                  count, min(expiries) if expiries else None)]
+
+
+def _claude_grant_kind(g):
+    if g.get('gives_back_weekly') is True:
+        return 'fable'
+    if g.get('type') in ('session', 'weekly', 'full'):
+        return g['type']
+    clears = g.get('clears') if isinstance(g.get('clears'), list) else []
+    session, other = 'five_hour' in clears, any(c != 'five_hour' for c in clears)
+    return 'session' if session and not other else 'weekly' if other and not session else 'full'
+
+
+def _future_epoch(s, now):
+    if not isinstance(s, str) or not _FULL_TIME.fullmatch(s):
+        return None
+    try:
+        t = datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+    return t if t > now else None
+
+
+def parse_claude_resets(block, now):
+    """Free resets in the usage answer's `cedar_ember` block (T3's claudeResetCreditsToContract)."""
+    if not isinstance(block, dict) or block.get('eligible') is not True:
+        return []
+    live = [g for g in block.get('grants') or []
+            if isinstance(g, dict) and isinstance(g.get('id'), str) and _GRANT_ID.fullmatch(g['id'])
+            and isinstance(g.get('resets_left'), int) and not isinstance(g['resets_left'], bool)
+            and g['resets_left'] >= 0 and g.get('paused') is not True and g.get('usable_now') is True
+            and (g.get('ends_at') is None or _future_epoch(g['ends_at'], now))]
+    if not any(g['id'] == block.get('next_grant_id') for g in live):
+        return []  # T3 shows none unless Anthropic names a usable next grant
+    out = []
+    for kind, (label, desc) in CLAUDE_KINDS.items():
+        grants = [g for g in live if g['resets_left'] > 0 and _claude_grant_kind(g) == kind]
+        if grants:
+            ends = [e for e in (_future_epoch(g.get('ends_at'), now) for g in grants) if e]
+            out.append(Reset('claude', kind, label, desc, sum(g['resets_left'] for g in grants),
+                             min(ends) if ends else None, grants[0]['id']))
+    return out
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):  # a redirect would carry the token to another address
+        return None
+
+
+_opener = None
+
+
+def _urlopen(req, timeout):
+    """The one place a Claude reset call reaches the network. Tests replace it."""
+    global _opener
+    if _opener is None:
+        from .update import TLS  # Windows' own certificate check
+        _opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=TLS), _NoRedirect)
+    return _opener.open(req, timeout=timeout)
+
+
+_version = None
+
+
+def _claude_version():
+    """`claude --version`, asked once per app run, for the user-agent (T3 sends the same)."""
+    global _version
+    if _version is None:
+        try:
+            out = subprocess.run(_claude_exe() + ['--version'], capture_output=True, text=True, timeout=15,
+                                 creationflags=CREATE_NO_WINDOW, cwd=_work_dir()).stdout.split()
+        except (ProbeError, OSError, subprocess.SubprocessError):
+            return None  # try again next time
+        _version = out[0] if out and re.fullmatch(r'[0-9][0-9A-Za-z.+-]*', out[0]) else ''
+    return _version or None
+
+
+def _claude_dir():
+    return os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _claude_call(method, url, body, timeout):
+    """(HTTP status, JSON body or None) from Anthropic, or None when there is no login to ask with.
+    Raises ProbeError on a network failure, with text that never holds the token."""
+    if not url.startswith(ANTHROPIC + '/'):
+        raise ProbeError('not an Anthropic address')
+    version = _claude_version()
+    if not version:
+        return None
+    creds = _read_json(os.path.join(_claude_dir(), '.credentials.json'))
+    oauth = creds.get('claudeAiOauth') if isinstance(creds, dict) else None
+    token = oauth.get('accessToken') if isinstance(oauth, dict) else None
+    token = token.strip() if isinstance(token, str) else ''
+    creds = oauth = None
+    if not token:
+        return None
+    req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={'authorization': f'Bearer {token}', 'anthropic-beta': 'oauth-2025-04-20',
+                                          'user-agent': f'claude-cli/{version} (external, cli)',
+                                          'content-type': 'application/json'})
+    token = None
+    try:
+        try:
+            with _urlopen(req, timeout) as r:
+                status, raw = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, b''
+            e.close()
+    except Exception as e:  # noqa: BLE001 - any failure becomes plain words, with the request (and token) dropped
+        raise ProbeError('no answer' if isinstance(e, TimeoutError) or 'timed out' in str(e) else 'network error') from None
+    finally:
+        req = None
+    try:
+        return status, json.loads(raw) if raw else None
+    except ValueError:
+        return status, None
+
+
+_claude_resets = {'at': None, 'value': [], 'account': None, 'lock': threading.Lock()}
+
+
+def claude_resets(now=None, force=False):
+    """Claude's free resets, asking Anthropic at most every 5 minutes (force: Refresh or right after a spend).
+    No login or a signed-out answer -> none, quietly. Too many requests or a network failure -> the last answer."""
+    now = time.time() if now is None else now
+    c = _claude_resets
+    try:
+        account = claude_account()
+    except (OSError, ValueError):
+        account = c['account']  # couldn't tell (a file mid-write): keep what we had
+    with c['lock']:
+        if account != c['account']:  # another account (or signed out): the last one's resets aren't its own
+            c['account'], c['value'], force = account, [], True
+        if not force and c['at'] is not None and now - c['at'] < CLAUDE_READ_SECS:
+            return c['value']
+        c['at'] = now
+        try:
+            got = _claude_call('GET', CLAUDE_USAGE_URL, None, 10)
+        except ProbeError as e:
+            log.info('claude resets: %s', e)
+            return c['value']
+        if got is None or got[0] in (401, 403):
+            c['value'] = []
+        elif got[0] == 200 and isinstance(got[1], dict):
+            c['value'] = parse_claude_resets(got[1].get('cedar_ember'), now)
+        else:
+            log.info('claude resets: answer %s', got[0])
+        return c['value']
+
+
+def use_claude_reset(grant_id, request_id):
+    """Spend one Claude reset. request_id is the idempotency key: reuse it to retry the same spend.
+    Returns a key of OUTCOMES."""
+    if not isinstance(grant_id, str) or not _GRANT_ID.fullmatch(grant_id) or \
+            not isinstance(request_id, str) or not _REQUEST_ID.fullmatch(request_id):
+        return 'failed'
+    acc = _read_json(_claude_config())
+    acc = acc.get('oauthAccount') if isinstance(acc, dict) else None
+    org = acc.get('organizationUuid') if isinstance(acc, dict) else None
+    org = org.strip() if isinstance(org, str) else ''
+    if not org:
+        return 'signed_out'
+    try:
+        got = _claude_call('POST', f"{ANTHROPIC}/api/organizations/{urllib.parse.quote(org, safe='')}/reset_rate_limits",
+                           {'program': 'cedar_ember', 'grant_id': grant_id, 'request_id': request_id}, 25)
+    except ProbeError as e:
+        log.info('claude reset spend: %s', e)
+        return 'failed'
+    if got is None or got[0] in (401, 403):
+        return 'signed_out'
+    if got[0] == 429:
+        return 'rate_limited'
+    if got[0] in (400, 404, 410, 422):  # this request refused (say, an expired grant); a retry's first try is unknown
+        return 'refused'
+    result = got[1].get('result') if got[0] == 200 and isinstance(got[1], dict) else None
+    return {'reset': 'reset', 'not_limited': 'nothing', 'already_used': 'already', 'ineligible': 'no_credit',
+            'cooldown': 'cooldown', 'unavailable': 'unconfirmed'}.get(result, 'failed')
+
+
+def use_codex_reset(idempotency_key, credit_id=None):
+    """Spend one Codex reset through the running Codex. Reuse the key to retry the same spend."""
+    params = {'idempotencyKey': idempotency_key}
+    if credit_id:
+        params['creditId'] = credit_id
+
+    def build(n):
+        def match(m):
+            if m.get('id') != n:
+                return None
+            return ('error', 'refused') if 'error' in m else ('ok', m.get('result'))
+        return {'jsonrpc': '2.0', 'id': n, 'method': 'account/rateLimitResetCredit/consume', 'params': params}, match
+    try:
+        result = CODEX.ask(build)
+    except ProbeError as e:
+        log.info('codex reset spend: %s', e)
+        return 'failed'
+    outcome = result.get('outcome') if isinstance(result, dict) else None
+    return {'reset': 'reset', 'nothingToReset': 'nothing', 'noCredit': 'no_credit',
+            'alreadyRedeemed': 'already'}.get(outcome, 'failed')
+
+
+def use_reset(reset, key=None):
+    """Spend one reset of this kind; pass the same `key` to retry the same spend. Returns a key of OUTCOMES.
+    Afterwards Claude's resets are asked again; Codex's come with its next check."""
+    key = key or uuid.uuid4().hex
+    if reset.provider == 'claude':
+        out = use_claude_reset(reset.credit_id, key)
+        if out in SPENT:  # gone, even if asking again below fails and keeps the last answer
+            with _claude_resets['lock']:
+                _claude_resets['value'] = without_one(_claude_resets['value'], reset.kind)
+        claude_resets(force=True)
+        return out
+    return use_codex_reset(key, reset.credit_id)
+
+
+SPENT = ('reset', 'already')  # outcomes after which that reset is used up
+SETTLED = SPENT + ('nothing', 'no_credit')  # outcomes that say for sure what happened to the spend
+
+
+def without_one(resets, kind):
+    """The list with one reset of this kind taken away."""
+    return [r if r.kind != kind else Reset(**{**vars(r), 'count': r.count - 1})
+            for r in resets if r.kind != kind or r.count > 1]
+
+
+def resets_line(resets, now):
+    """'Free resets: 2 · Weekly reset ×1, Full reset ×1 · first expires Nov 20', or None when there are none."""
+    if not resets:
+        return None
+    line = f'Free resets: {sum(r.count for r in resets)} · ' + ', '.join(f'{r.label} ×{r.count}' for r in resets)
+    exp = [r.expires_at for r in resets if r.expires_at and r.expires_at > now]
+    if exp:
+        d = datetime.fromtimestamp(min(exp))
+        line += f" · first expires {d.strftime('%b')} {d.day}"
+    return line
