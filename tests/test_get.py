@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +39,15 @@ def github():
                      'browser_download_url': f'{srv.url}/download/AIUsage.zip'}]}).encode()
             elif self.path == '/download/AIUsage.zip':
                 body = srv.zip
+                srv.zip_requests += 1
+                if srv.stall_first and srv.zip_requests == 1:  # half the file, then silence
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body[:len(body) // 2])
+                    self.wfile.flush()
+                    time.sleep(90)
+                    return
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -52,6 +62,7 @@ def github():
 
     srv = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     srv.zip = fake_zip()
+    srv.zip_requests, srv.stall_first = 0, False
     srv.digest = 'sha256:' + hashlib.sha256(srv.zip).hexdigest()
     srv.url = f'http://127.0.0.1:{srv.server_address[1]}'
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -91,6 +102,19 @@ def test_update_replaces_the_old_copy(github, tmp_path):
     assert 'Install failed' not in out, out
     assert (dest / 'AIUsage.exe').read_bytes() == b'fake exe v2'
     assert sorted(p.name for p in tmp_path.iterdir()) == ['AIUsage']  # no .new or .old left behind
+
+
+@pytest.mark.skipif(not (Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'curl.exe').exists(),
+                    reason='the retry comes from curl.exe; the Invoke-WebRequest fallback has none')
+def test_a_download_that_stalls_starts_again(github, tmp_path):
+    """The first download sends half the zip, then nothing (a dropped connection). get.ps1 must give up on it and
+    download again, not wait forever on a window that says "Downloading"."""
+    github.stall_first = True
+    dest = tmp_path / 'AIUsage'
+    out = get(github.url, dest)
+    assert 'Install failed' not in out, out
+    assert (dest / 'AIUsage.exe').read_bytes() == b'fake exe v2'
+    assert github.zip_requests >= 2
 
 
 @pytest.mark.parametrize('digest', ['sha256:' + '0' * 64, None, '', 'md5:abc'])

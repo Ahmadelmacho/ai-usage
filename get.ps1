@@ -23,7 +23,19 @@
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('AIUsage-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory $tmp | Out-Null
         $zip = Join-Path $tmp 'AIUsage.zip'
-        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip -Headers @{ 'User-Agent' = 'ai-usage-installer' }
+        $curl = Join-Path $env:SystemRoot 'System32\curl.exe'  # in Windows since 10 1803
+        if (Test-Path -LiteralPath $curl) {
+            # A progress bar, and a download that stalls (under 1 KB/s for 20 s, e.g. a dropped connection) starts
+            # again, up to 5 times. Invoke-WebRequest showed nothing and could wait on a dead connection for minutes.
+            $ErrorActionPreference = 'Continue'  # curl draws its bar on stderr, which 'Stop' would treat as an error
+            # -q first: ignore any .curlrc (it could turn off the certificate check); redirects stay on https
+            & $curl -q -fL --proto-redir '=https' --progress-bar --retry 5 --retry-delay 2 --connect-timeout 20 --speed-limit 1000 --speed-time 20 `
+                -A 'ai-usage-installer' -o $zip $asset.browser_download_url
+            $ErrorActionPreference = 'Stop'
+            if ($LASTEXITCODE) { throw "the download failed (curl exit $LASTEXITCODE). Check the connection and try again." }
+        } else {
+            Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip -Headers @{ 'User-Agent' = 'ai-usage-installer' }
+        }
         # .NET, not Get-FileHash/Expand-Archive: those are script modules, and Windows PowerShell started under a
         # pwsh 7 PSModulePath (e.g. by an app launched from a pwsh 7 terminal) loads pwsh 7's copies, which fail
         $stream = [IO.File]::OpenRead($zip)
