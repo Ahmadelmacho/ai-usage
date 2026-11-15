@@ -79,7 +79,7 @@ try {
     if ($promoted -lt 2) { Write-Host "If you don't see them, click the ^ arrow by the clock and drag them out." }
     foreach ($cli in @(@{ Cmd = 'claude'; Name = 'Claude Code' }, @{ Cmd = 'codex'; Name = 'Codex (optional)' })) {
         if (-not (Get-Command $cli.Cmd -ErrorAction SilentlyContinue)) {
-            Write-Host "Note: $($cli.Name) is not installed, so its number shows '-'." -ForegroundColor Yellow
+            Write-Host "Note: $($cli.Name) is not installed, so it has no tray number until you install it and sign in." -ForegroundColor Yellow
         }
     }
 } catch {

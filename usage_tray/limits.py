@@ -34,6 +34,13 @@ class ProbeError(Exception):
     """A check failed; the message is shown to the user, so keep it short and plain."""
 
 
+class Unavailable(ProbeError):
+    """The CLI is not installed ('Not installed') or answers that no one is signed in ('Not signed in'): that
+    provider gets no tray number, only a small card in the window. Any other failure keeps the last numbers."""
+
+
+NOT_INSTALLED, NOT_SIGNED_IN = 'Not installed', 'Not signed in'
+
 @dataclass
 class Row:
     key: str
@@ -49,10 +56,13 @@ class ProviderState:
     checked_at: float | None = None  # last successful check
     error: str | None = None  # last attempt's failure, None when it worked
     resets: list['Reset'] = field(default_factory=list)
+    missing: str | None = None  # 'Not installed' / 'Not signed in' (see Unavailable) until a check works again
+    # {'email', 'plan'} for the hover card (claude_who / codex_who): in memory only, never saved, logged or shown in repr
+    account: dict | None = field(default=None, repr=False, compare=False)
 
     def to_json(self):
         return {'rows': [asdict(r) for r in self.rows], 'checked_at': self.checked_at,
-                'resets': [asdict(r) for r in self.resets]}
+                'resets': [asdict(r) for r in self.resets], 'missing': self.missing}
 
     @classmethod
     def from_json(cls, d):
@@ -78,7 +88,10 @@ class ProviderState:
                 raise TypeError('bad cached reset')
             resets.append(Reset(r['provider'], r['kind'], r['label'], r['description'], count,
                                 None if exp is None else float(exp), r.get('credit_id')))
-        return cls(rows=rows, checked_at=checked, resets=resets)
+        missing = d.get('missing')  # files from before this have none
+        if missing not in (None, NOT_INSTALLED, NOT_SIGNED_IN):
+            raise TypeError('bad cached missing')
+        return cls(rows=rows, checked_at=checked, resets=resets, missing=missing)
 
 
 @dataclass
@@ -282,9 +295,10 @@ class Session:
 
     MAX_AGE = 1800
 
-    def __init__(self, argv, hello, extra_env=None, name='cli', login=None):
+    def __init__(self, argv, hello, extra_env=None, name='cli', login=None, greet=None):
         self.argv = argv  # list, or a function returning one (raises ProbeError when the CLI is missing)
         self.hello = hello  # messages sent once after starting
+        self.greet = greet  # picks the CLI's answer to `hello` out of a message (None: not it); see greeting()
         self.extra_env = extra_env
         self.name = name
         self.login = login  # function naming who is signed in (None = signed out); raises OSError/ValueError if it can't tell
@@ -335,6 +349,9 @@ class Session:
                 msg = json.loads(line)
             except ValueError:
                 continue
+            g = self.greet(msg) if self.greet and isinstance(msg, dict) else None
+            if g is not None:
+                p.greeting = g
             w = self.waiter
             if w and w[0] is p and isinstance(msg, dict):
                 hit = w[1](msg)
@@ -394,6 +411,11 @@ class Session:
         with self.lock:
             self._close()
 
+    def greeting(self):
+        """The running copy's answer to `hello` (picked by greet), or None. The CLI answers in order, so after a
+        check it has arrived."""
+        return getattr(self.p, 'greeting', None)
+
     def _close(self):
         p = self.p
         if p is None:
@@ -421,18 +443,18 @@ def _work_dir():
     return d
 
 
-def _which(name, label):
+def _which(name):
     def argv():
         # On Windows shutil.which looks in the current folder before PATH (even with path=) unless this is set.
         os.environ['NoDefaultCurrentDirectoryInExePath'] = '1'
         exe = shutil.which(name)
         if not exe:
-            raise ProbeError(f'{label} not found')
+            raise Unavailable(NOT_INSTALLED)
         return [exe]
     return argv
 
 
-_claude_exe, _codex_exe = _which('claude', 'Claude Code'), _which('codex', 'Codex')
+_claude_exe, _codex_exe = _which('claude'), _which('codex')
 # Both CLIs update plugins and marketplaces in the background (dozens of `git clone`s, and a restart cuts a
 # big clone off so the next start begins it again). Claude: DISABLE_AUTOUPDATER turns its plugin auto-update
 # off (it starts after a random delay), and skipping the user settings file skips loading the plugins (the
@@ -443,12 +465,15 @@ CLAUDE = Session(lambda: _claude_exe() + [
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--no-session-persistence'],
     [{'type': 'control_request', 'request_id': 'init', 'request': {'subtype': 'initialize'}}],
     {'ENABLE_CLAUDEAI_MCP_SERVERS': 'false', 'CLAUDE_CODE_AUTO_CONNECT_IDE': '0', 'CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL': '1',
-     'DISABLE_AUTOUPDATER': '1'}, name='claude', login=lambda: claude_account())
+     'DISABLE_AUTOUPDATER': '1'}, name='claude', login=lambda: claude_account(), greet=lambda m: _claude_who(m))
 CODEX = Session(lambda: _codex_exe() + ['app-server'] + [
     a for f in ('plugins', 'plugin_discovery_prefetch', 'remote_plugin', 'apps', 'in_app_updates',
                 'skill_mcp_dependency_install') for a in ('--disable', f)], [
     {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'ai-usage', 'version': '1.0'}}},
-    {'jsonrpc': '2.0', 'method': 'initialized'}], name='codex', login=lambda: codex_login())
+    {'jsonrpc': '2.0', 'method': 'initialized'},
+    {'jsonrpc': '2.0', 'id': 'account', 'method': 'account/read', 'params': {}}],  # who is signed in, as T3 asks
+    name='codex', login=lambda: codex_login(),
+    greet=lambda m: m['result'] if m.get('id') == 'account' and isinstance(m.get('result'), dict) else None)
 
 
 def ask_claude():
@@ -464,7 +489,92 @@ def ask_claude():
                 return 'error', str(r.get('error') or 'refused')[:60]
             return 'ok', r.get('response')
         return {'type': 'control_request', 'request_id': rid, 'request': {'subtype': 'get_usage', 'skip_behaviors': True}}, match
-    return CLAUDE.ask(build)
+    raw = CLAUDE.ask(build)
+    if not (isinstance(raw, dict) and raw.get('rate_limits_available')) and claude_signed_out(CLAUDE.greeting()):
+        raise Unavailable(NOT_SIGNED_IN)
+    return raw
+
+
+def _claude_who(m):
+    """The `account` part of Claude's answer to initialize (who is signed in), or None for any other message."""
+    r = m.get('response') if m.get('type') == 'control_response' else None
+    if not isinstance(r, dict) or r.get('request_id') != 'init':
+        return None
+    body = r.get('response')
+    return (body.get('account') if isinstance(body, dict) else None) or {}
+
+
+def claude_signed_out(account):
+    """Claude's answer to initialize, signed out: {"tokenSource": "none", "apiProvider": "firstParty"}. An API key
+    or another provider (Bedrock, Vertex) is someone signed in, with no plan limits."""
+    return (isinstance(account, dict) and account.get('tokenSource') == 'none' and not account.get('apiKeySource')
+            and account.get('apiProvider', 'firstParty') == 'firstParty')
+
+
+# ---------- who is signed in: the hover card's email and plan, read the way T3 reads them ----------
+# Both come from answers the CLIs already give (Claude: initialize; Codex: account/read and rateLimits/read).
+# They live only in ProviderState.account: never saved, logged or sent anywhere.
+
+def _text(v):
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+CLAUDE_PLANS = {'claudemaxsubscription': 'Max', 'claudemax5xsubscription': 'Max', 'claudemax20xsubscription': 'Ultra',
+                'claudeenterprisesubscription': 'Enterprise', 'claudeteamsubscription': 'Team',
+                'claudeprosubscription': 'Pro', 'claudefreesubscription': 'Free', 'max': 'Max', 'maxplan': 'Max',
+                'max5': 'Max', 'max20': 'Ultra', 'enterprise': 'Enterprise', 'team': 'Team', 'pro': 'Pro',
+                'free': 'Free'}
+CODEX_PLANS = {'free': 'ChatGPT Free Subscription', 'go': 'ChatGPT Go Subscription', 'plus': 'ChatGPT Plus Subscription',
+               'pro': 'ChatGPT Pro 200 Subscription', 'prolite': 'ChatGPT Pro 100 Subscription',
+               'promax': 'ChatGPT Pro 500 Subscription',
+               'self_serve_business_prolite': 'ChatGPT Business Premium Subscription',
+               'team': 'ChatGPT Business Subscription', 'self_serve_business_usage_based': 'ChatGPT Business Subscription',
+               'business': 'ChatGPT Business Subscription', 'ent26': 'ChatGPT Enterprise Subscription',
+               'enterprise_cbp_automation': 'ChatGPT Enterprise Subscription',
+               'enterprise_cbp_usage_based': 'ChatGPT Enterprise Subscription',
+               'enterprise': 'ChatGPT Enterprise Subscription', 'edu': 'ChatGPT Edu Subscription',
+               'edu_plus': 'ChatGPT Edu Subscription', 'edu_pro': 'ChatGPT Edu Subscription',
+               'unknown': 'ChatGPT Subscription'}
+
+
+def claude_plan(subscription_type):
+    """T3's plan name for Claude's subscriptionType ('max' -> 'Claude Max Subscription'), or None."""
+    sub = _text(subscription_type)
+    if not sub:
+        return None
+    flat = lambda s: re.sub(r'[\s_-]+', '', s.lower())
+    label = CLAUDE_PLANS.get(flat(sub)) or ' '.join(w[0].upper() + w[1:].lower() for w in re.split(r'[\s_-]+', sub) if w)
+    n = flat(label)
+    if n.startswith('claude'):
+        return label if n.endswith('subscription') else f'{label} Subscription'
+    return f'Claude {label}' if n.endswith('subscription') else f'Claude {label} Subscription'
+
+
+def codex_plan(plan_type):
+    """T3's plan name for a Codex planType ('plus' -> 'ChatGPT Plus Subscription'), or None for one it doesn't know."""
+    return CODEX_PLANS.get(plan_type) if isinstance(plan_type, str) else None
+
+
+def claude_who(account):
+    """{'email', 'plan'} from the `account` part of Claude's answer to initialize, or None."""
+    if not isinstance(account, dict):
+        return None
+    return {'email': _text(account.get('email')), 'plan': claude_plan(account.get('subscriptionType'))}
+
+
+def codex_who(account_read, result):
+    """{'email', 'plan'} for a ChatGPT login: the email from account/read, the plan from the rateLimits/read answer
+    (else the account's own planType). None for any other login or an unknown answer."""
+    acct = account_read.get('account') if isinstance(account_read, dict) else None
+    if not isinstance(acct, dict) or acct.get('type') != 'chatgpt':
+        return None
+    rl = result.get('rateLimits') if isinstance(result, dict) else None
+    usage = rl.get('planType') if isinstance(rl, dict) else None
+    return {'email': _text(acct.get('email')),
+            'plan': (None if usage == 'unknown' else codex_plan(usage)) or codex_plan(acct.get('planType'))}
+
+
+CODEX_SIGNED_OUT = 'codex account authentication required'  # an API-key login says 'chatgpt authentication ...'
 
 
 def ask_codex():
@@ -478,7 +588,12 @@ def ask_codex():
                 return 'error', str(err.get('message') if isinstance(err, dict) else err)[:60]
             return 'ok', m.get('result')
         return {'jsonrpc': '2.0', 'id': n, 'method': 'account/rateLimits/read', 'params': None}, match
-    return CODEX.ask(build)
+    try:
+        return CODEX.ask(build)
+    except ProbeError as e:
+        if str(e).startswith(CODEX_SIGNED_OUT):
+            raise Unavailable(NOT_SIGNED_IN) from None
+        raise
 
 
 def fetch_claude():
@@ -580,18 +695,33 @@ def pace(row, now):
     return 'under' if diff > 5 else 'over' if diff < -5 else 'on'
 
 
+def span(secs):
+    """'4d 13h', '18h 3m' or '27m' (T3's duration words)."""
+    s = max(0, int(secs))
+    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
+    return f'{d}d {h}h' if d else f'{h}h {m}m' if h else f'{m}m'
+
+
 def countdown(row, now):
     if row.resets_at is None:
         return None
     s = int(row.resets_at - now)
-    if s <= 0:
-        return 'now'
-    d, h, m = s // 86400, s % 86400 // 3600, s % 3600 // 60
-    return f'{d}d {h}h' if d else f'{h}h {m}m' if h else f'{max(m, 1)}m'
+    return 'now' if s <= 0 else span(max(s, 60))
 
 
 def clock(ts):
     return datetime.fromtimestamp(ts).strftime('%I:%M %p').lstrip('0')
+
+
+def when(ts, now):
+    """T3's date for a time: '2:23 AM' today, 'tomorrow at 2:23 AM', 'yesterday at ...', else '11/19 10:00 PM'."""
+    d, today = datetime.fromtimestamp(ts), datetime.fromtimestamp(now)
+    days = (d.date() - today.date()).days
+    if days == 0:
+        return clock(ts)
+    if days in (1, -1):
+        return f"{'tomorrow' if days == 1 else 'yesterday'} at {clock(ts)}"
+    return f"{d.month}/{d.day}{'' if d.year == today.year else f'/{d.year}'} {clock(ts)}"
 
 
 STALE_SECS = 120  # numbers older than this show their own time ("numbers from 3:00 PM") instead of "checked"
@@ -602,9 +732,11 @@ def stale(state, now):
 
 
 def tray_row(provider, rows):
-    """Claude icon = weekly limit; Codex icon = 5-hour limit of the main Codex limit."""
+    """Claude icon = the 5-hour (Session) limit, or the weekly one when the plan has no 5-hour limit (Ultra);
+    Codex icon = 5-hour limit of the main Codex limit, else its first one."""
     if provider == 'claude':
-        return next((r for r in rows if r.key == 'seven_day'), None)
+        keys = {r.key: r for r in rows}
+        return keys.get('five_hour') or keys.get('seven_day')
     if not rows:
         return None
     main = [r for r in rows if r.key.split(':')[0] == rows[0].key.split(':')[0]]  # parse_codex puts the main limit first
@@ -624,7 +756,9 @@ def _utf16_len(s):
 
 def tooltip(name, state, now):
     """Hover text, cut to what Windows' tray hover text can hold."""
-    if state.error:
+    if state.missing:
+        head = f'{name} · {state.missing.lower()}'
+    elif state.error:
         head = f'{name} · check failed: {state.error}'
     elif state.checked_at:
         head = f"{name} · {'numbers from' if stale(state, now) else 'checked'} {clock(state.checked_at)}"
@@ -923,15 +1057,3 @@ def without_one(resets, kind):
     """The list with one reset of this kind taken away."""
     return [r if r.kind != kind else Reset(**{**vars(r), 'count': r.count - 1})
             for r in resets if r.kind != kind or r.count > 1]
-
-
-def resets_line(resets, now):
-    """'Free resets: 2 · Weekly reset ×1, Full reset ×1 · first expires Nov 20', or None when there are none."""
-    if not resets:
-        return None
-    line = f'Free resets: {sum(r.count for r in resets)} · ' + ', '.join(f'{r.label} ×{r.count}' for r in resets)
-    exp = [r.expires_at for r in resets if r.expires_at and r.expires_at > now]
-    if exp:
-        d = datetime.fromtimestamp(min(exp))
-        line += f" · first expires {d.strftime('%b')} {d.day}"
-    return line

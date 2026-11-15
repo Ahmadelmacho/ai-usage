@@ -10,8 +10,8 @@ NOW = 1_800_000_000.0
 
 def states(n_codex=2, n_claude=2, err=None):
     mk = lambda n, mins: [L.Row(f'r{i}', 'Weekly · Sonnet' if i else 'Session', 30 + i, NOW + 3600, mins) for i in range(n)]
-    return {'codex': L.ProviderState(mk(n_codex, 300), NOW - 60, err),
-            'claude': L.ProviderState(mk(n_claude, 10080), NOW - 60)}
+    return {'claude': L.ProviderState(mk(n_claude, 10080), NOW - 60),
+            'codex': L.ProviderState(mk(n_codex, 300), NOW - 60, err)}
 
 
 @pytest.mark.parametrize('scale', [1.0, 1.25, 1.5, 2.0])
@@ -38,7 +38,8 @@ def test_maximized_window_is_filled_and_centered(scale):
     assert img.getpixel((10, 700)) == bg and img.getpixel((2550, 1390)) == bg
 
 
-@pytest.mark.parametrize('text', ['Check for updates', 'Checking…', 'Up to date (v10.10.10)', "Couldn't check"])
+@pytest.mark.parametrize('text', ['Check for updates', 'Checking…', 'Up to date (v10.10.10)', "Couldn't check",
+                                  'GitHub busy, try at 12:59 PM'])
 def test_check_button_fits_by_the_title_and_moves_nothing(text):
     st = states()
     plain, _ = draw.render_window(st, NOW, draw.W_MIN, 1.0)
@@ -72,7 +73,7 @@ def test_window_height_grows_with_rows_and_errors():
 
 @pytest.mark.parametrize('busy', [True, False])
 def test_empty_and_failed_states_render(busy):
-    st = {'codex': L.ProviderState([], None, 'Codex not found'), 'claude': L.ProviderState()}
+    st = {'claude': L.ProviderState(), 'codex': L.ProviderState([], None, 'no answer in 25 s')}
     img, _ = draw.render_window(st, NOW, 640, 1.0, busy)
     assert img.size[1] == draw.window_height(st)
 
@@ -161,41 +162,180 @@ def with_resets():
     return st
 
 
+def rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
 @pytest.mark.parametrize('light', [False, True])
 @pytest.mark.parametrize('scale', [1.0, 1.5])
-def test_resets_line_and_use_links(scale, light):
+def test_every_bar_is_a_hover_target_and_resets_show_as_a_chip(scale, light):
     draw.use_palette(light)
     try:
         st = with_resets()
-        assert draw.window_height(st) == draw.window_height(states()) + 2 * (10 + 22 + 22)
+        assert draw.window_height(st) == draw.window_height(states())  # free resets live in the chip and the card
         img, hits = draw.render_window(st, NOW, 640, scale)
-        assert img.height == round(draw.window_height(st) * scale)
-        uses = {k: v for k, v in hits.items() if k.startswith('use:')}
-        assert set(uses) == {'use:claude:weekly', 'use:claude:full', 'use:codex:codex'}
-        (cx0, cy0, cx1, cy1), (wx0, wy0, wx1, wy1) = uses['use:claude:full'], uses['use:claude:weekly']
-        assert wy0 == cy0 and wx1 < cx0  # one line, side by side
-        assert hits['use:codex:codex'][1] < wy0  # Codex comes first, as its cards do
-        link = tuple(int(draw.LINK[i:i + 2], 16) for i in (1, 3, 5))
-        box = img.crop(uses['use:claude:weekly'])
-        assert any(sum(abs(a - b) for a, b in zip(px, link)) < 60 for px in box.get_flattened_data())  # drawn in the link color
+        plain, _ = draw.render_window(states(), NOW, 640, scale)
+        assert img.height == round(draw.window_height(st) * scale) and not any(k.startswith('use:') for k in hits)
+        bars = {k: v for k, v in hits.items() if k.startswith('bar:')}
+        assert set(bars) == {'bar:claude:r0', 'bar:claude:r1', 'bar:codex:r0', 'bar:codex:r1'}
+        assert bars['bar:claude:r0'][1] < bars['bar:codex:r0'][1]  # Claude first, as before
+        x0, y0, x1, y1 = bars['bar:claude:r0']
+        assert y1 - y0 == round(draw.BAR_H * scale) and x1 - x0 > 200 * scale
+        # the ticket count is drawn in the chip at the bar's right end, nowhere else
+        assert img.crop((x0, y0, x1, y1)).tobytes() != plain.crop((x0, y0, x1, y1)).tobytes()
+        assert img.crop((0, 0, x0, img.height)).tobytes() == plain.crop((0, 0, x0, img.height)).tobytes()
     finally:
         draw.use_palette(False)
 
 
-def test_no_resets_no_line():
-    _, hits = draw.render_window(states(), NOW, 640, 1.0)
-    assert not any(k.startswith('use:') for k in hits)
-
-
-def test_note_takes_the_links_place():
+def window_case(case):
+    """'both' work, 'claude' only, 'codex' only, or 'none'; the other one is not installed / not signed in."""
     st = with_resets()
+    for p, text in (('claude', L.NOT_SIGNED_IN), ('codex', L.NOT_INSTALLED)):
+        if case not in ('both', p):
+            st[p] = L.ProviderState(missing=text, error='old error', resets=list(st[p].resets))  # none of it shows
+    return st
+
+
+@pytest.mark.parametrize('light', [False, True])
+@pytest.mark.parametrize('case', ['both', 'claude', 'codex', 'none'])
+def test_missing_provider_is_a_small_card(case, light):
+    draw.use_palette(light)
+    try:
+        st = window_case(case)
+        img, hits = draw.render_window(st, NOW, 640, 1.0)
+        assert img.height == draw.window_height(st, NOW)
+        for p in ('claude', 'codex'):
+            shown = case in ('both', p)
+            assert any(k.startswith(f'bar:{p}:') for k in hits) == shown  # no bars, so no hover card
+            h = draw.window_height({p: st[p]}, NOW)
+            assert (h == 64 + draw.HEAD_H + draw.NOTE_H + draw.PAD) != shown  # logo, name and one small card
+        fill = {rgb(draw.FILL[p]) for p in ('claude', 'codex')}
+        has_bars = sum(px in fill for px in img.convert('RGB').get_flattened_data()) > 500  # gray text edges match a few
+        assert has_bars == (case != 'none')
+    finally:
+        draw.use_palette(False)
+
+
+def test_a_note_shows_under_the_cards():
+    st = with_resets()
+    assert draw.window_height(st, notes={'claude': 'Using a reset…'}) == draw.window_height(st) + draw.STATUS_H
     img, hits = draw.render_window(st, NOW, 640, 1.0, notes={'claude': 'Using a reset…'})
-    assert img.height == draw.window_height(st, notes={'claude': 'x'}) == draw.window_height(st)
-    assert 'use:codex:codex' in hits and not any(k.startswith('use:claude') for k in hits)
-    st['claude'].resets = []  # the last one used: the note still shows, on its own line
-    assert draw.window_height(st, notes={'claude': 'Reset used'}) == draw.window_height(st) + 10 + 22
-    img, hits = draw.render_window(st, NOW, 640, 1.0, notes={'claude': 'Reset used'})
-    assert img.height == draw.window_height(st, notes={'claude': 'Reset used'})
+    assert img.height == draw.window_height(st, notes={'claude': 'x'})
+    plain, plain_hits = draw.render_window(st, NOW, 640, 1.0)
+    assert hits['bar:claude:r1'] == plain_hits['bar:claude:r1']  # Claude's cards stay put...
+    assert hits['bar:codex:r0'][1] == plain_hits['bar:codex:r0'][1] + draw.STATUS_H  # ...Codex moves down for it
+
+
+# ---------- the hover card ----------
+
+def card_state(email='you@example.com', plan='Claude Max Subscription'):
+    st = with_resets()['claude']
+    st.account = {'email': email, 'plan': plan}
+    return st
+
+
+def test_card_words_from_fake_data():
+    from datetime import datetime
+    now = datetime(2026, 11, 15, 8, 20).timestamp()
+    row = L.Row('seven_day', 'Weekly', 7.4, datetime(2026, 11, 19, 22, 0).timestamp(), 10080)
+    st = card_state()
+    st.resets = [L.Reset('claude', 'fable', 'Fable reset', '', 1, now + 114 * 86400 + 3 * 3600 + 59, 'g1'),
+                 L.Reset('claude', 'full', 'Full reset', '', 2, None, 'g2')]
+    m = draw.card_model('claude', st, row, now, 'MY-PC')
+    assert (m['name'], m['email'], m['plan'], m['host']) == ('Claude', 'you@example.com', 'Claude Max Subscription', 'MY-PC')
+    assert m['rows'] == [('Left', '93%'), ('Resets', '11/19 10:00 PM · in 4d 13h'), ('Even pace', '65% left by now'),
+                         ('Restores', '+7% of pool')]
+    assert m['credits'] == [('Fable reset · 1 left · expires in 114d 3h', 'Use', 'fable'),
+                            ('Full reset · 2 left', 'Use', 'full')]
+    codex = L.ProviderState(resets=[L.Reset('codex', 'codex', 'Codex reset', '', 1, now + 27 * 86400 + 17 * 3600)])
+    m = draw.card_model('codex', codex, L.Row('p', 'Session', 0, now + 3600, 300), now)
+    assert m['credits'] == [('1 banked · expires in 27d 17h', 'Use reset', 'codex')]
+    assert ('Restores', '+0% of pool') not in m['rows'] and m['rows'][2] == ('Even pace', '20% left by now')
+
+
+def test_card_leaves_out_what_it_cannot_know():
+    st = L.ProviderState([L.Row('m', 'Monthly spend', 40, None, None)], NOW)  # no reset time, no account read
+    m = draw.card_model('claude', st, st.rows[0], NOW)
+    assert m['rows'] == [('Left', '60%')] and m['credits'] == []
+    assert (m['email'], m['plan'], m['host']) == (None, None, None)
+    assert draw.card_height(m) < draw.card_height(draw.card_model('claude', card_state(), states()['claude'].rows[0],
+                                                                  NOW, 'MY-PC'))
+
+
+def test_scramble_keeps_the_shape_and_hides_the_letters():
+    s = draw.scramble('you.name@example.com')
+    assert len(s) == 20 and s[3] == '.' and s[8] == '@' and s[16] == '.' and s != 'you.name@example.com'
+    assert s == draw.scramble('you.name@example.com') and s != draw.scramble('you.other@example.com')
+
+
+@pytest.mark.parametrize('light', [False, True])
+@pytest.mark.parametrize('scale', [1.0, 1.5])
+def test_card_sits_above_its_bar_and_inside_the_window(scale, light):
+    draw.use_palette(light)
+    try:
+        st = with_resets()
+        st['claude'].account = {'email': 'you@example.com', 'plan': 'Claude Max Subscription'}
+        img, hits = draw.render_window(st, NOW, 640, scale)
+        for name in ('bar:claude:r0', 'bar:codex:r1'):
+            p, key = name.split(':')[1:]
+            row = next(r for r in st[p].rows if r.key == key)
+            m = draw.card_model(p, st[p], row, NOW, 'MY-PC')
+            patch, (px, py), ch = draw.render_card(img, m, hits[name], scale)
+            x0, y0, x1, y1 = ch['card']
+            assert 0 <= px <= x0 and 0 <= py <= y0 and x1 <= px + patch.width <= img.width and y1 <= py + patch.height <= img.height
+            assert y1 - y0 == round(draw.card_height(m) * scale) and x1 - x0 == round(draw.CARD_W * scale)
+            bx0, by0, bx1, by1 = hits[name]
+            above = y1 <= by0 - round(draw.CARD_OFFSET * scale) + 1
+            below = y0 >= by1 + round(draw.CARD_OFFSET * scale) - 1
+            assert above or below
+            assert above == (name == 'bar:codex:r1')  # the top bar has no room above it: its card flips below
+            uses = sorted(k for k in ch if k.startswith('use:'))
+            assert uses == ([f'use:{p}:{r.kind}' for r in sorted(st[p].resets, key=lambda r: r.kind)])
+            for k in uses + ['email'] * (p == 'claude'):
+                a0, b0, a1, b1 = ch[k]
+                assert x0 <= a0 < a1 <= x1 and y0 <= b0 < b1 <= y1
+            assert ('email' in ch) == (p == 'claude')  # Codex has no account here: no email line
+    finally:
+        draw.use_palette(False)
+
+
+def test_the_tallest_card_gets_room_in_a_short_window():
+    kinds = ['session', 'weekly', 'fable', 'full']
+    st = {'claude': L.ProviderState([L.Row('r0', 'Session', 30, NOW + 3600, 300)], NOW,
+                                    resets=[L.Reset('claude', k, f'{k} reset', '', 1, None, f'g{k}') for k in kinds]),
+          'codex': L.ProviderState(missing=L.NOT_INSTALLED)}
+    st['claude'].account = {'email': 'you@example.com', 'plan': 'Claude Max Subscription'}
+    room = draw.card_room(st, NOW, 'MY-PC')
+    assert room > draw.window_height(st, NOW)  # this card needs more than the window's content
+    img, hits = draw.render_window(st, NOW, draw.W_MIN, 1.0, height=room)  # the app makes the window this tall
+    m = draw.card_model('claude', st['claude'], st['claude'].rows[0], NOW, 'MY-PC')
+    _, _, ch = draw.render_card(img, m, hits['bar:claude:r0'], 1.0)
+    x0, y0, x1, y1 = ch['card']
+    assert draw.CARD_MARGIN <= x0 and x1 <= img.width - draw.CARD_MARGIN
+    assert draw.CARD_MARGIN <= y0 and y1 <= img.height - draw.CARD_MARGIN  # all of it on screen...
+    for k in kinds:
+        assert y0 <= ch[f'use:claude:{k}'][1] < ch[f'use:claude:{k}'][3] <= y1  # ...down to the last button
+
+
+def test_card_glass_blurs_what_is_behind_it_and_email_shows_only_on_reveal():
+    from PIL import ImageChops
+    st = with_resets()
+    st['claude'].account = {'email': 'you@example.com', 'plan': None}
+    img, hits = draw.render_window(st, NOW, 640, 1.0)
+    m = draw.card_model('claude', st['claude'], st['claude'].rows[1], NOW, None)
+    hidden, pos, ch = draw.render_card(img, m, hits['bar:claude:r1'], 1.0)
+    shown, _, _ = draw.render_card(img, m, hits['bar:claude:r1'], 1.0, reveal=True)
+    ex0, ey0, ex1, ey1 = ch['email']
+    box = (ex0 - pos[0], ey0 - pos[1], ex1 - pos[0], ey1 - pos[1])
+    assert hidden.crop(box).tobytes() != shown.crop(box).tobytes()
+    assert ImageChops.difference(hidden, shown).getbbox() is not None
+    other = img.copy()
+    other.paste((255, 0, 0), (0, 0, img.width, img.height))  # a different window behind: the glass shows it
+    tinted, _, _ = draw.render_card(other, m, hits['bar:claude:r1'], 1.0)
+    cx = (ch['card'][0] + ch['card'][2]) // 2 - pos[0]
+    r, g, b = tinted.getpixel((cx, 4 + ch['card'][1] - pos[1]))
+    assert r > g + 40  # red shows through the frosted glass
 
 
 @pytest.mark.parametrize('scale', [1.0, 1.25, 1.5])

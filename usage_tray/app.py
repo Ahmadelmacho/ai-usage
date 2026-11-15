@@ -1,20 +1,23 @@
-"""AI Usage: two tray numbers (Claude weekly % left, Codex 5-hour % left) and a Limits window like T3 Code's."""
+"""AI Usage: two tray numbers (Claude 5-hour % left, or weekly on a plan with no 5-hour limit; Codex 5-hour % left)
+and a Limits window like T3 Code's. A provider that is not installed or not signed in gets no tray number."""
 import ctypes
 import json
 import logging
 import os
 import queue
+import socket
 import sys
 import tempfile
 import threading
 import time
 import tkinter as tk
 import uuid
+from types import SimpleNamespace
 from tkinter import colorchooser, messagebox
 from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 from pystray import Menu, MenuItem
 from pystray._util import win32
 from pystray._win32 import Icon as Win32Icon
@@ -26,7 +29,10 @@ REFRESH_SECS = 5  # checks every 5 s. Cheap because both CLIs stay running betwe
 MAX_BACKOFF_SECS = 300  # when checks keep failing, wait up to 5 min between tries
 UPDATE_FIRST_SECS, UPDATE_SECS = 60, 6 * 3600  # update check 1 min after start, then every 6 hours
 NOTE_MS = 4000  # how long "Up to date" / "Couldn't check" stays after a check by hand
-RESET_NOTE_MS = 6000  # how long "Reset used" (or why not) stays after a "Use a reset" click
+RESET_NOTE_MS = 6000  # how long "Reset used" (or why not) stays after a "Use" click
+CARD_OPEN_MS = 300  # T3 (Base UI): the mouse rests this long on a bar before its hover card opens
+CARD_CLOSE_MS = 150  # time to cross from a bar to its card before the card closes
+HOST = os.environ.get('COMPUTERNAME') or socket.gethostname()  # the hover card's "Signed in", as T3 names this PC
 HEALTH_SECS = 600  # a health line in app.log 1 min after start, then every 10 min, and on Close
 NAMES = {'claude': 'Claude Code', 'codex': 'Codex'}
 DATA = L._work_dir()  # %LOCALAPPDATA%\AIUsage, made here at import
@@ -67,8 +73,29 @@ class TrayIcon(Win32Icon):
         self._uid = uid
         self._lock = threading.RLock()
         self._menu_open = self._menu_stale = False
+        self._want = True  # shown or hidden, as show() last asked
         super().__init__(*args, **kwargs)
         self._message_handlers[WM_REBUILD_MENU] = self._on_rebuild_menu
+
+    def run(self):
+        super().run(lambda icon: icon.show())
+
+    def show(self, want=None):
+        """Show or hide the icon (None: apply the last wish). Before its message loop is ready this only remembers
+        it, and run() applies it."""
+        with self._lock:
+            if want is not None:
+                self._want = want
+            if self._running:
+                self.visible = self._want
+
+    def _on_taskbarcreated(self, wparam, lparam):  # Explorer restarted: re-add, unless a hide runs at that moment
+        with self._lock:
+            super()._on_taskbarcreated(wparam, lparam)
+
+    def _on_display_change(self, wparam, lparam):
+        with self._lock:
+            super()._on_display_change(wparam, lparam)
 
     def rebuild_menu(self):
         """Re-read the menu items' text and visibility. pystray destroys and remakes the native menu, so do it on
@@ -145,7 +172,7 @@ def work_area(hwnd=None):
 class App:
     def __init__(self, start_hidden):
         self.q = queue.Queue()
-        self.states = {'codex': L.ProviderState(), 'claude': L.ProviderState()}  # window order, as in T3
+        self.states = {'claude': L.ProviderState(), 'codex': L.ProviderState()}  # window order: Claude on top
         self.load_cache()
         self.sched = {p: {'busy': False, 'last': 0.0, 'fails': 0} for p in self.states}  # per provider
         self.counts = {p: self.new_counts() for p in self.states}  # checks since the last health line
@@ -179,6 +206,16 @@ class App:
         self.slots = {}  # fade key -> what that place last showed, so new text fades in
         self.tk_hover = {}  # Settings window widgets with a hover look: key -> (widget, color, hover color)
         self.alpha = 1.0
+        self.screen_ver = 0  # counts full redraws, so the hover card knows its glass is out of date
+        self.card_bar = None  # 'bar:<provider>:<row key>' whose hover card is open or fading out
+        self.card_open = False
+        self.card_wait = None  # the bar the mouse rests on before its card opens
+        self.card_jobs = {}  # 'open' / 'close' -> after() id
+        self.card_cache = None  # (what the card showed, (patch, top-left, hits))
+        self.card_hits = {}  # the open card's clickables, screen px
+        self.card_shown = None  # (fade, what) last put on screen
+        self.reveal = False  # the card's email shown (a click on it, like T3); hidden again when the card closes
+        self.mouse = None  # where the mouse last was over the window (None: outside it)
 
         self.root = root = tk.Tk()
         root.withdraw()
@@ -193,7 +230,7 @@ class App:
         self.label.pack(fill='both', expand=True)
         self.label.bind('<Button-1>', self.on_click)
         self.label.bind('<Motion>', self.on_motion)
-        self.label.bind('<Leave>', lambda e: self.set_hover(None))
+        self.label.bind('<Leave>', self.on_leave)
         root.bind('<Configure>', self.on_configure)
         self._last_size = None
         self.apply_theme()
@@ -228,7 +265,7 @@ class App:
 
     def save_cache(self):
         data = json.dumps({p: s.to_json() for p, s in self.states.items()})
-        rows = json.dumps({p: (s.to_json()['rows'], s.to_json()['resets']) for p, s in self.states.items()})
+        rows = json.dumps({p: {k: v for k, v in s.to_json().items() if k != 'checked_at'} for p, s in self.states.items()})
         if rows == self.saved and time.time() - self.saved_at < 300:
             return  # numbers unchanged: write at most every 5 minutes
         tmp = CACHE + '.tmp'
@@ -261,16 +298,21 @@ class App:
                 # Claude may answer with numbers Anthropic sent a while ago: keep their real time (None = unknown)
                 rows, sent_at = L.fetch_claude_dated()
                 resets = self._claude_resets(force)
+                who = L.claude_who(L.CLAUDE.greeting())
             else:
-                rows, resets = fetch_codex()
+                rows, resets, who = fetch_codex()
                 sent_at = time.time()
-            self.q.put(('result', p, rows, None, sent_at, time.time() - t0, resets))
+            self.q.put(('result', p, rows, None, sent_at, time.time() - t0, resets, None, who))
+        except L.Unavailable as e:
+            log.info('%s: %s', p, e)
+            self.q.put(('result', p, None, None, time.time(), time.time() - t0, None, str(e), None))
         except L.ProbeError as e:
             log.warning('%s check failed: %s', p, e)
-            self.q.put(('result', p, None, str(e), time.time(), time.time() - t0, None))
+            self.q.put(('result', p, None, str(e), time.time(), time.time() - t0, None, None, None))
         except Exception:
             log.exception('%s check crashed', p)
-            self.q.put(('result', p, None, 'unexpected error (see app.log)', time.time(), time.time() - t0, None))
+            self.q.put(('result', p, None, 'unexpected error (see app.log)', time.time(), time.time() - t0, None, None,
+                        None))
 
     @staticmethod
     def _claude_resets(force):
@@ -294,8 +336,9 @@ class App:
     def _check_updates(self):
         try:
             self.q.put(('checked', update.check(strict=True), None))
-        except Exception:
-            self.q.put(('checked', None, "Couldn't check"))
+        except Exception as e:
+            until = update.busy_until(e)
+            self.q.put(('checked', None, f'GitHub busy, try at {L.clock(until)}' if until else "Couldn't check"))
 
     def check_text(self):
         return 'Checking…' if self.checking else self.check_note or 'Check for updates'
@@ -315,7 +358,10 @@ class App:
         self.note_job = self.root.after(self.fade_ms(), self._set_note, None)
 
     def interval(self, p):
-        """5 s normally; doubles with each failure in a row, up to 5 min, so a broken login can't spin the CPU."""
+        """5 s normally; doubles with each failure in a row, up to 5 min, so a broken login can't spin the CPU.
+        Not installed or signed out: every 5 min, so it comes back by itself (Refresh asks at once)."""
+        if self.states[p].missing:
+            return MAX_BACKOFF_SECS
         return min(MAX_BACKOFF_SECS, REFRESH_SECS * 2 ** min(self.sched[p]['fails'], 10))
 
     def busy(self):
@@ -369,10 +415,14 @@ class App:
                 self.recheck.add(p)
             self.refresh(manual=True, only=[p], force=False)  # the Claude spend already asked its resets again
         elif msg[0] == 'result':
-            _, p, rows, err, ts, secs, resets = msg
+            _, p, rows, err, ts, secs, resets, missing, who = msg
             st, s, c = self.states[p], self.sched[p], self.counts[p]
-            if rows is not None:
+            if missing:  # not installed or signed out: its old numbers and resets go, the card says why
+                st.rows, st.resets, st.checked_at, st.error, st.missing = [], [], None, None, missing
+                st.account = None
+            elif rows is not None:
                 st.rows, st.checked_at, st.error = rows, L.numbers_time(st, rows, ts, time.time()), None
+                st.missing, st.account = None, who
             else:
                 st.error = err
             if resets is not None and p not in self.recheck:  # a check begun before a spend has old resets
@@ -459,7 +509,9 @@ class App:
     def update_ui(self):
         now = self.last_ui = time.time()
         n = tray_size()
+        gone = {p for p, st in self.states.items() if st.missing}
         for p, ic in self.icons.items():
+            ic.show(p not in gone or (p == 'claude' and gone == set(self.icons)))  # one stays, so the app can be opened
             st = self.states[p]
             row = L.tray_row(p, st.rows)
             left = L.left_pct(row, now) if row else None
@@ -489,14 +541,14 @@ class App:
         self.start_motion(busy, notes, now)
         shown = [(L.left_pct(r, now), L.countdown(r, now), L.pace(r, now))  # what each row shows right now
                  for st in self.states.values() for r in st.rows]
-        sig = (repr([(st.rows, st.error, L.stale(st, now)) for st in self.states.values()]), shown,
+        content_h = self.content_height(now, notes, s)
+        sig = (repr([(st.rows, st.error, st.missing, L.stale(st, now)) for st in self.states.values()]), shown,
                [st.checked_at and L.clock(st.checked_at) for st in self.states.values()], busy, w, h, s, int(now // 60),
-               self.update_tag, self.check_text(), repr([st.resets for st in self.states.values()]), notes)
+               self.update_tag, self.check_text(), repr([st.resets for st in self.states.values()]), notes, content_h)
         fx = self.fx()
         if sig == self.drawn:
-            self.redraw_parts(fx)
+            self.show(force=self.redraw_parts(fx))
             return
-        content_h = round(draw.window_height(self.states, now, notes) * s)
         parts = []
         img, self.hits = draw.render_window(self.states, now, w / s, s, busy, h / s, self.update_tag,
                                               self.check_text(), notes, fx, parts)
@@ -505,6 +557,11 @@ class App:
         self.screen, self.parts = img, parts
         self.part_fx = [tuple(fx.get(k) for k in part[0]) for part in parts]
         self.drawn = sig  # only once drawn, so a failed render is retried
+        self.screen_ver += 1
+        self.card_shown = (0.0, None)  # the new picture has no card on it yet
+        self.show()
+        if self.card_open and self.mouse:  # things moved: the mouse may not be on the card or its bar any more
+            self.track_card(self.mouse)
         self.root.minsize(round(draw.W_MIN * s), content_h)
         if self.root.state() == 'normal' and h < content_h:
             # grow to fit the content, upward when it would run under the taskbar of the window's monitor
@@ -512,6 +569,10 @@ class App:
             over = self.root.winfo_rooty() + content_h + round(12 * s) - work.bottom
             y = max(work.top, self.root.winfo_y() - max(0, over))
             self.root.geometry(f'{w}x{content_h}+{self.root.winfo_x()}+{y}')
+
+    def content_height(self, now, notes, s):
+        """Window height in screen px: the content, or the tallest hover card if that needs more."""
+        return round(max(draw.window_height(self.states, now, notes), draw.card_room(self.states, now, HOST)) * s)
 
     # ---------- motion ----------
 
@@ -535,10 +596,10 @@ class App:
             self.spinning = busy
             self.anim.spin('spin') if busy else self.anim.settle('spin')
         slots = {'fade:check': self.check_text()}
-        for p, st in self.states.items():
-            slots[f'fade:{p}'] = notes.get(p) or [r.kind for r in st.resets]
+        for p in self.states:
+            slots[f'fade:{p}'] = notes.get(p)
         for key, shows in slots.items():
-            if key in self.slots and self.slots[key] != shows:
+            if key in self.slots and self.slots[key] != shows and shows:
                 self.anim.to(key, 1.0, anim.FADE_MS, start=0.0)
             self.slots[key] = shows
         for p, st in self.states.items():
@@ -550,17 +611,20 @@ class App:
                     self.anim.set(key, left)  # first numbers show at once
 
     def redraw_parts(self, fx):
-        """Redraw only the parts whose motion changed, into the picture already shown."""
+        """Redraw only the parts whose motion changed, into the window picture. True if any did."""
         changed = False
         for i, part in enumerate(self.parts):
             now = tuple(fx.get(k) for k in part[0])
             if now != self.part_fx[i]:
-                im, xy = draw.render_part(part, fx)
-                self.screen.paste(im, xy)
+                im, (x, y) = draw.render_part(part, fx)
+                self.screen.paste(im, (x, y))
                 self.part_fx[i] = now
                 changed = True
-        if changed:
-            self._photo.paste(self.screen)
+                if self.card_cache:  # a part under the card moved: its glass is drawn again
+                    patch, (cx, cy), _ = self.card_cache[1]
+                    if x < cx + patch.width and cx < x + im.width and y < cy + patch.height and cy < y + im.height:
+                        self.card_cache = None
+        return changed
 
     def on_frame(self):
         a = self.anim.value('window', 1.0)
@@ -590,6 +654,7 @@ class App:
 
     def hide_window(self):
         """The X: hide, and stop whatever moves (the next open starts still)."""
+        self.close_card(at_once=True)
         self.root.withdraw()
         self.anim.cancel()
         self.anim.values = {k: v for k, v in self.anim.values.items() if k.startswith('card:')}
@@ -601,7 +666,7 @@ class App:
             self.placed = True
             s = self.scale()
             w = round(680 * s)
-            h = round(draw.window_height(self.states, time.time(), self.notes()) * s)
+            h = self.content_height(time.time(), self.notes(), s)
             work = work_area()
             margin = round(12 * s)
             root.geometry(f'{w}x{h}+{max(work.left, work.right - w - margin)}+{max(work.top, work.bottom - h - margin - round(32 * s))}')
@@ -643,10 +708,30 @@ class App:
         return x0 <= e.x <= x1 and y0 <= e.y <= y1
 
     def hit_name(self, e):
-        names = ['refresh', 'settings', 'update', 'check'] + [n for n in self.hits if n.startswith('use:')]
-        return next((n for n in names if self._hit(e, n)), None)
+        """The clickable under the mouse that eases on hover: a button, a link, or one on the hover card."""
+        on_card = self.card_hit(e)
+        if on_card:
+            return None if on_card == 'card' else on_card
+        return next((n for n in ('refresh', 'settings', 'update', 'check') if self._hit(e, n)), None)
 
     def on_click(self, e):
+        self.mouse = SimpleNamespace(x=e.x, y=e.y)
+        on_card = self.card_hit(e)
+        if on_card:
+            if on_card.startswith('use:'):
+                _, p, kind = on_card.split(':')
+                self.close_card(at_once=True)  # like T3: the card closes, then the question
+                self.use_reset(p, kind)
+            elif on_card == 'email':
+                self.reveal = not self.reveal
+                self.show()
+            return
+        bar = self.bar_at(e)
+        if bar:  # a click opens its card at once, a second one closes it
+            self.close_card() if self.card_open and bar == self.card_bar else self.open_card(bar)
+            return
+        if self.card_open:
+            self.close_card()
         name = self.hit_name(e)
         if name:
             self.press(name)
@@ -658,28 +743,146 @@ class App:
             self.q.put('check')
         elif self._hit(e, 'settings'):
             self.open_settings()
-        else:
-            hit = next((n for n in self.hits if n.startswith('use:') and self._hit(e, n)), None)
-            if hit:
-                _, p, kind = hit.split(':')
-                self.use_reset(p, kind)
 
     def on_motion(self, e):
+        self.mouse = SimpleNamespace(x=e.x, y=e.y)
         name = self.hit_name(e)
-        self.label.configure(cursor='hand2' if name else '')
+        self.label.configure(cursor='hand2' if name or (not self.card_hit(e) and self.bar_at(e)) else '')
         self.set_hover(name)
+        self.track_card(e)
+
+    def on_leave(self, e):
+        self.mouse = None
+        self.set_hover(None)
+        self.card_wait = None
+        self._card_job('open')
+        if self.card_open:
+            self._card_job('close', CARD_CLOSE_MS, self.close_card)
+
+    # ---------- hover card ----------
+
+    def bar_at(self, e):
+        return next((n for n in self.hits if n.startswith('bar:') and self._hit(e, n)), None)
+
+    def card_hit(self, e):
+        """On the open card: its clickable under the mouse ('use:...', 'email'), else 'card'. Off it: None."""
+        inside = lambda b: b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3]
+        if not self.card_open or not inside(self.card_hits.get('card', (0, 0, -1, -1))):
+            return None
+        return next((n for n, b in self.card_hits.items() if n != 'card' and inside(b)), 'card')
+
+    def near_card(self, e):
+        """On the open card, its bar, or the gap between them: where the card stays open."""
+        if 'card' not in self.card_hits or self.card_bar not in self.hits:
+            return False
+        cx0, cy0, cx1, cy1 = card = self.card_hits['card']
+        bx0, by0, bx1, by1 = bar = self.hits[self.card_bar]
+        gap = (max(cx0, bx0), min(cy1, by1), min(cx1, bx1), max(cy0, by0))
+        return any(b[0] <= e.x <= b[2] and b[1] <= e.y <= b[3] for b in (card, bar, gap))
+
+    def _card_job(self, kind, ms=None, fn=None):
+        """Cancel the card's pending 'open' or 'close'; with fn, schedule it in its place."""
+        job = self.card_jobs.pop(kind, None)
+        if job:
+            self.root.after_cancel(job)
+        if fn:
+            self.card_jobs[kind] = self.root.after(ms, lambda: (self.card_jobs.pop(kind, None), fn()))
+
+    def track_card(self, e):
+        """T3's hover card: rest on a bar and its card opens; it stays while the mouse is on the bar, the card or
+        the gap between them, and closes a moment after the mouse leaves them."""
+        bar = None if self.card_hit(e) else self.bar_at(e)
+        if self.card_open and bar in (None, self.card_bar) and self.near_card(e):
+            self._card_job('close')
+            return
+        if bar:
+            self._card_job('close')
+            if self.card_open:
+                self.open_card(bar)  # from one bar to the next: its card at once
+            elif bar != self.card_wait:
+                self.card_wait = bar
+                self._card_job('open', CARD_OPEN_MS, lambda: self.mouse and self.bar_at(self.mouse) == bar
+                               and self.open_card(bar))  # only if the bar is still under the mouse
+            return
+        self.card_wait = None
+        self._card_job('open')
+        if self.card_open and 'close' not in self.card_jobs:
+            self._card_job('close', CARD_CLOSE_MS, self.close_card)
+
+    def open_card(self, bar):
+        for kind in ('open', 'close'):
+            self._card_job(kind)
+        self.card_wait = None
+        if bar not in self.hits:
+            return
+        if not self.card_open:
+            self.reveal = False
+        self.card_bar, self.card_open = bar, True
+        self.anim.to('card', 1.0, anim.FADE_MS, start=self.anim.value('card', 0.0))
+        self.show()
+
+    def close_card(self, at_once=False):
+        for kind in ('open', 'close'):
+            self._card_job(kind)
+        self.card_wait, self.card_open = None, False
+        if at_once:
+            self.anim.set('card', 0.0)
+        else:
+            self.anim.to('card', 0.0, anim.FADE_MS, start=self.anim.value('card', 0.0))
+        self.show()
+
+    def card_layer(self):
+        """(patch, top-left, hits) of the card over the window picture now; drawn again only when it changed.
+        None when its row is gone."""
+        _, p, key = self.card_bar.split(':', 2)
+        st = self.states[p]
+        row = next((r for r in st.rows if r.key == key), None)
+        if self.card_bar not in self.hits or row is None or st.missing:
+            return None
+        m = draw.card_model(p, st, row, time.time(), HOST, busy=self.spending == p)
+        fx = {n: self.anim.value(n, 0.0) for r in st.resets for n in (f'use:{p}:{r.kind}', f'use:{p}:{r.kind}!')}
+        sig = (self.card_bar, repr(m), self.reveal, tuple(fx.items()), self.hits[self.card_bar], self.screen_ver)
+        if not self.card_cache or self.card_cache[0] != sig:
+            self.card_cache = (sig, draw.render_card(self.screen, m, self.hits[self.card_bar], self.scale(), fx,
+                                                     self.reveal))
+        return self.card_cache[1]
+
+    def show(self, force=False):
+        """Put the window picture on screen, with the hover card over it while it is open or fading out."""
+        if self.screen is None:
+            return
+        a, layer = self.anim.value('card', 0.0), None
+        if self.card_bar:
+            layer = self.card_layer()
+            if layer is None or not (self.card_open or a):  # its row went, or it faded out
+                self.card_bar, self.card_open, self.card_cache, layer = None, False, None, None
+                self.anim.set('card', 0.0)
+        a = a if layer else 0.0
+        self.card_hits = layer[2] if layer and self.card_open else {}
+        look = (a, self.card_cache[0] if layer else None)
+        if look == self.card_shown and not force:
+            return
+        img = self.screen
+        if layer:
+            patch, (x, y), _ = layer
+            img = img.copy()
+            if a < 1:
+                patch = Image.blend(img.crop((x, y, x + patch.width, y + patch.height)), patch, a)
+            img.paste(patch, (x, y))
+        self._photo.paste(img)
+        self.card_shown = look
 
     # ---------- free resets ----------
 
     def notes(self):
-        """Text in place of each provider's "Use a reset" links: while one is spent, then its outcome."""
+        """A line under each provider's cards: while one of its resets is spent, then the outcome."""
         notes = dict(self.reset_notes)
         if self.spending:
             notes[self.spending] = 'Using a reset…'
         return notes
 
     def use_reset(self, p, kind):
-        """The "Use a reset" link: ask first, then spend one off the window thread. One spend at a time."""
+        """A "Use" button on the hover card: ask first, then spend one off the window thread. One at a time."""
         if self.spending:
             return
         r = next((r for r in self.states[p].resets if r.kind == kind), None)
@@ -721,7 +924,7 @@ class App:
         self.update_ui()
 
     def _reset_out(self, p):
-        """Fade the outcome out, then put the links back (they fade in)."""
+        """Fade the outcome out, then take its line away."""
         self.fade_to(f'fade:{p}', 0.0)
         self.reset_jobs[p] = self.root.after(self.fade_ms(), self._reset_note, p, None)
 
@@ -781,6 +984,7 @@ class App:
             w.destroy()
         self.tk_hover = {}
         bg, fg = draw.BG, draw.TEXT
+        control, hot, edge = (draw.solid(c) for c in (draw.CONTROL, draw.CONTROL_HOVER, draw.CONTROL_EDGE))
         body, head = ('Segoe UI', 10), ('Segoe UI Semibold', 11)
         top.configure(bg=bg, padx=22, pady=16)
 
@@ -788,27 +992,27 @@ class App:
             tk.Label(top, text=text, bg=bg, fg=fg, font=font).grid(row=row, column=0, columnspan=4, sticky='w', **grid)
 
         def button(text, cmd, row, col):  # hover tints it; pressed, it shows activebackground
-            b = tk.Button(top, text=text, command=cmd, bg=draw.CHIP, fg=fg, activebackground=draw.BORDER,
+            b = tk.Button(top, text=text, command=cmd, bg=control, fg=fg, activebackground=edge,
                           activeforeground=fg, relief='flat', bd=0, highlightthickness=1,
-                          highlightbackground=draw.BORDER, padx=10, pady=2, font=body, cursor='hand2')
+                          highlightbackground=edge, padx=10, pady=2, font=body, cursor='hand2')
             b.grid(row=row, column=col, padx=(6, 0), pady=3)
-            self.hoverable(b, f'tk:{row}:{col}', draw.CHIP, draw.HATCH_BG)
+            self.hoverable(b, f'tk:{row}:{col}', control, hot)
 
         label('Window theme', 0, head, pady=(0, 4))
         self._theme_var = tk.StringVar(top, self.prefs['theme'])
         for i, (key, name) in enumerate(S.THEMES.items()):
             r = tk.Radiobutton(top, text=name, value=key, variable=self._theme_var, bg=bg, fg=fg,
-                               activebackground=draw.BORDER, activeforeground=fg, selectcolor=draw.CHIP,
+                               activebackground=edge, activeforeground=fg, selectcolor=control,
                                highlightthickness=0, bd=0, padx=4, font=body, cursor='hand2',
                                command=lambda: self.set_pref('theme', self._theme_var.get()))
             r.grid(row=1 + i, column=0, columnspan=4, sticky='w', pady=1)
-            self.hoverable(r, f'tk:radio:{key}', bg, draw.HATCH_BG)
+            self.hoverable(r, f'tk:radio:{key}', bg, hot)
         label('Tray number colors', 4, head, pady=(14, 4))
         for i, p in enumerate(('claude', 'codex')):
             row = 5 + i
             tk.Label(top, text=NAMES[p], bg=bg, fg=fg, font=body).grid(row=row, column=0, sticky='w', padx=(0, 14))
             tk.Frame(top, bg=self.prefs[p], width=22, height=22, highlightthickness=1,
-                     highlightbackground=draw.BORDER).grid(row=row, column=1, padx=(0, 4))
+                     highlightbackground=edge).grid(row=row, column=1, padx=(0, 4))
             button('Change…', lambda p=p: self.pick_color(p), row, 2)
             button('Reset', lambda p=p: self.set_pref(p, S.DEFAULTS[p]), row, 3)
         top.update_idletasks()
@@ -858,9 +1062,9 @@ class App:
 
 
 def fetch_codex():
-    """Codex's rows and free resets, from one answer."""
+    """Codex's rows, free resets and who is signed in (for the hover card), from one answer."""
     raw = L.ask_codex()
-    return L.parse_codex(raw), L.parse_codex_resets(raw)
+    return L.parse_codex(raw), L.parse_codex_resets(raw), L.codex_who(L.CODEX.greeting(), raw)
 
 
 def single_instance(show_existing, name='AIUsage'):

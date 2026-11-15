@@ -2,6 +2,10 @@
 
 A Windows tray app that shows how much of your Claude Code and Codex plan limits you have left, as two numbers next to the clock.
 
+<img src="docs/screenshots/dark.png" width="680" alt="The Usage limits window in dark mode: Claude's and Codex's limits as bars, with a hover card open on Codex's weekly bar">
+
+The window in dark mode, with the card that opens when you hover a bar.
+
 Not made by or affiliated with Anthropic or OpenAI.
 Claude and Codex logos are trademarks of Anthropic and OpenAI.
 Logo images come from [Lobe Icons](https://github.com/lobehub/lobe-icons) (MIT, see `usage_tray/logos/LICENSE`).
@@ -25,16 +29,35 @@ The app looks for a new release a minute after it starts and every 6 hours after
 
 ## What it shows
 
-- Orange number: Claude's weekly % left. White number: Codex's 5-hour % left, or the weekly one if your plan has no 5-hour limit. Both turn amber at 25% and red at 10%.
+- Orange number: Claude's 5-hour % left, or the weekly one if your plan has no 5-hour limit. White number: Codex's 5-hour % left, or the weekly one if your plan has no 5-hour limit. Both turn amber at 25% and red at 10%.
+- If Claude Code or Codex is not installed or not signed in, it gets no number. The window shows a small "Not installed" or "Not signed in" card for it, and the number comes back by itself within 5 minutes of a sign-in (or at once on Refresh). If neither one works, the Claude number stays as "–" so you can still open the app.
 - Hover a number for reset times. Click it to open the window. Right-click for Check for updates, Refresh, Open and Close.
+- In the window, hover a bar for a card with your email, plan, this PC's name, what's left, when it resets and how you compare to an even pace. The email stays blurred until you click it. Settings has Dark, Light and Match Windows.
 - It checks every 5 seconds. When a check fails, it keeps showing the last good numbers and tries again a little later.
-- Free resets: when Claude or Codex gives you free limit resets, the window shows how many you have, of which kind, and when the first one expires. Each kind has a **Use a reset** link. It asks "Are you sure?" first, because a used reset can't be given back.
+- Free resets: when Claude or Codex gives you free limit resets, each bar shows how many you have, and the hover card shows each kind and when it expires. Each kind has a **Use** button (**Use reset** for Codex). It asks "Use a … reset?" first, because a used reset can't be given back.
+
+## What it looks like
+
+<img src="docs/screenshots/tray.png" width="190" alt="A dark taskbar with 94 in orange and 100 in white next to the clock">
+
+The two tray numbers: Claude in orange, Codex in white.
+
+<img src="docs/screenshots/light.png" width="480" alt="The Usage limits window in light mode with Claude's three limits and Codex's two">
+
+The window in light mode.
+
+<img src="docs/screenshots/not-installed.png" width="480" alt="The Usage limits window with a small Not installed card where Codex's limits would be">
+
+When Codex is not installed, it gets a small card and no tray number.
+
+The pictures are drawn from made-up numbers with `python docs/screenshots/make.py`.
 
 ## What it reads
 
 - For free resets only, it reads your Claude login key: the `claudeAiOauth.accessToken` value in `~/.claude/.credentials.json` (or in your `CLAUDE_CONFIG_DIR`). It reads the file only when it makes one of the two reset calls below. It sends the key only to `https://api.anthropic.com`, with Windows' certificate check on. It never saves, logs or refreshes the key, and never writes the file. If the key is missing or expired, the app shows no Claude resets.
 - For `~/.codex/auth.json` it looks only at the time the file changed, to notice a new login.
 - From `~/.claude.json` it reads three values: your account id, your organization id (for a Claude reset) and the usage numbers Claude saved.
+- Your email and plan come from answers the two programs already give (see below). The app shows them only in the window. It never saves, logs or sends them.
 - It sends no prompts, so it spends no tokens.
 - It keeps the last numbers and a log in `%LOCALAPPDATA%\AIUsage`. The log can hold error text from the CLIs, so read it before you share it.
 
@@ -42,10 +65,10 @@ The app looks for a new release a minute after it starts and every 6 hours after
 
 It asks your own signed-in `claude` and `codex` programs, the same way [T3 Code](https://github.com/pingdotgg/t3code) (MIT) does:
 
-- Claude: `claude -p --input-format stream-json`, then the control request `get_usage`. Anthropic doesn't document this request, so a Claude Code update can break it.
-- Codex: `codex app-server`, then the documented method `account/rateLimits/read`.
-- Claude free resets: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, at most every 5 minutes. **Use a reset** sends `POST /api/organizations/<your org>/reset_rate_limits`. Anthropic doesn't document these calls either.
-- Codex free resets come in the `account/rateLimits/read` answer. **Use a reset** sends `account/rateLimitResetCredit/consume`.
+- Claude: `claude -p --input-format stream-json`, then the control request `get_usage`. Anthropic doesn't document this request, so a Claude Code update can break it. The email and plan come from Claude's `initialize` answer.
+- Codex: `codex app-server`, then the documented methods `account/rateLimits/read` and `account/read` (for the email).
+- Claude free resets: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, at most every 5 minutes. **Use** sends `POST /api/organizations/<your org>/reset_rate_limits`. Anthropic doesn't document these calls either.
+- Codex free resets come in the `account/rateLimits/read` answer. **Use reset** sends `account/rateLimitResetCredit/consume`.
 
 Both programs stay running between checks, with plugins and auto-updates off. The app restarts them every 30 minutes, after a failed check, and when you switch accounts. When the app quits, they quit too.
 

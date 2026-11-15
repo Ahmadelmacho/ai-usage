@@ -31,6 +31,8 @@ def api():
         def do_GET(self):
             srv.paths.append((self.path, self.headers.get('User-Agent')))
             self.send_response(srv.status)
+            for k, v in srv.headers.items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(srv.body)
 
@@ -38,7 +40,7 @@ def api():
             pass
 
     srv = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-    srv.status, srv.body, srv.paths = 200, b'{}', []
+    srv.status, srv.body, srv.paths, srv.headers = 200, b'{}', [], {}
     srv.url = f'http://127.0.0.1:{srv.server_address[1]}'
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield srv
@@ -129,3 +131,42 @@ def test_check_verifies_certificates_with_windows(monkeypatch):
     update.check()
     assert isinstance(seen['context'], truststore.SSLContext)
     assert seen['context'].verify_mode == ssl.CERT_REQUIRED and seen['context'].check_hostname is True
+
+
+SOON = int(__import__('time').time()) + 1800
+
+
+@pytest.mark.parametrize('status, headers, want', [
+    (403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(SOON)}, float(SOON)),
+    (429, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(SOON)}, float(SOON)),
+    (403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': 'inf'}, None),
+    (403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1e300'}, None),
+    (403, {'retry-after': 'nan'}, None),
+    (403, {'x-ratelimit-remaining': '12'}, None),  # some other 403
+    (404, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(SOON)}, None),
+    (403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': 'soon'}, None),
+])
+def test_busy_until_reads_githubs_refill_time(api, status, headers, want):
+    api.status, api.body, api.headers = status, b'{"message": "API rate limit exceeded"}', headers
+    with pytest.raises(Exception) as e:
+        update.check(api.url, '1.0.0', strict=True)
+    assert update.busy_until(e.value) == want
+
+
+def test_busy_until_retry_after_and_plain_errors():
+    import urllib.error
+    from email.message import Message
+    h = Message()
+    h['retry-after'] = '60'
+    t = update.busy_until(urllib.error.HTTPError('u', 429, 'Too Many', h, None))
+    assert t is not None and 50 < t - __import__('time').time() <= 60
+    assert update.busy_until(OSError('offline')) is None
+
+
+def test_busy_until_takes_the_later_of_both_headers(api):
+    import time
+    api.status, api.headers = 403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(int(time.time()) + 10),
+                                    'retry-after': '60'}
+    with pytest.raises(Exception) as e:
+        update.check(api.url, '1.0.0', strict=True)
+    assert update.busy_until(e.value) - time.time() > 50

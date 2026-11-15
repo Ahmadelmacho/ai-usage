@@ -9,6 +9,7 @@ import pytest
 from usage_tray import app as A, limits as L
 
 NOW = time.time()
+WHO = {'email': 'you@example.com', 'plan': 'ChatGPT Plus Subscription'}  # who the fake Codex says is signed in
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def fake_checks(monkeypatch, tmp_path):
     fetch_codex = make('codex')
     resets = answers['resets'] = {'claude': [], 'codex': []}  # free resets the fakes report; tests fill them
     forced = answers['forced'] = []  # each Claude resets read: was it forced?
-    monkeypatch.setattr(A, 'fetch_codex', lambda: (fetch_codex(), list(resets['codex'])))
+    monkeypatch.setattr(A, 'fetch_codex', lambda: (fetch_codex(), list(resets['codex']), dict(WHO)))
     monkeypatch.setattr(L, 'claude_resets', lambda force=False: forced.append(force) or list(resets['claude']))
     monkeypatch.setattr(L, 'close_all', lambda: None)
     monkeypatch.setattr(L, 'fetch_claude_dated', lambda: (L.fetch_claude(), time.time()))  # not ~/.claude.json
@@ -155,10 +156,68 @@ def test_full_cycle(fake_checks, monkeypatch):
     assert all(not t.is_alive() for t in app.icon_threads)  # Close removed both tray icons
 
 
+def test_missing_provider_hides_its_icon_and_comes_back(fake_checks, monkeypatch):
+    """Not installed / not signed in: no tray icon, old numbers gone, a slow check. A plain failure keeps the icon
+    and numbers. With both missing, the Claude icon stays as "–" so the app can still be opened."""
+    calls, answers, tmp = fake_checks
+    codex_rows = answers['codex']
+    old = L.ProviderState(codex_rows(), NOW - 600)  # numbers from an earlier run, now not installed
+    (tmp / 'last.json').write_text(json.dumps({'codex': old.to_json()}))
+
+    def missing(text):
+        def fetch():
+            raise L.Unavailable(text)
+        return fetch
+    answers['codex'] = missing(L.NOT_INSTALLED)
+    app = A.App(start_hidden=True)
+    assert app.states['codex'].rows == old.rows and list(app.states) == ['claude', 'codex']  # Claude on top
+
+    def first_check():
+        st = app.states['codex']
+        assert st.missing == 'Not installed' and st.rows == [] and st.error is None
+        assert not app.icons['codex'].visible and app.icons['claude'].visible
+        assert app.shown['claude'][:2] == ('70', 'ok')
+        saved = json.loads((tmp / 'last.json').read_text())['codex']
+        assert saved['rows'] == [] and saved['missing'] == 'Not installed'  # the old numbers don't come back
+        assert app.interval('codex') == 300 and app.interval('claude') == 60
+        answers['codex'] = codex_rows  # installed and signed in now
+        app.q.put('refresh')
+
+    def back():
+        assert app.states['codex'].missing is None and app.icons['codex'].visible
+        assert app.shown['codex'][:2] == ('20', 'amber')
+
+        def offline():
+            raise L.ProbeError('network error')
+        answers['codex'] = offline
+        app.q.put('refresh')
+
+    def failure_keeps_it():
+        st = app.states['codex']
+        assert st.error == 'network error' and len(st.rows) == 2 and st.missing is None
+        assert app.icons['codex'].visible and app.shown['codex'][0] == '20'
+        answers['claude'] = missing(L.NOT_SIGNED_IN)
+        answers['codex'] = missing(L.NOT_INSTALLED)
+        app.q.put('refresh')
+
+    def both_missing():
+        assert app.icons['claude'].visible and not app.icons['codex'].visible
+        assert app.shown['claude'][:2] == ('–', 'none')
+        assert app.icons['claude'].title == 'Claude Code · not signed in'
+        app.q.put('open')
+
+    def window_fits():
+        assert app.root.winfo_height() >= A.draw.window_height(app.states)
+        assert not any(k.startswith('bar:') for k in app.hits)  # no bars, so no hover card
+        assert app.states['claude'].account is None and app.states['codex'].account is None
+
+    drive(app, [(1500, first_check), (800, back), (800, failure_keeps_it), (800, both_missing), (600, window_fits)])
+
+
 class Bare:
     """Just the state App.load_cache works on (Tk can only start once per test run reliably)."""
     def __init__(self):
-        self.states = {'codex': L.ProviderState(), 'claude': L.ProviderState()}
+        self.states = {'claude': L.ProviderState(), 'codex': L.ProviderState()}
 
 
 def test_starts_from_saved_numbers(fake_checks):
@@ -201,9 +260,13 @@ def test_second_copy_opens_the_first_ones_window():
 def test_backoff_doubles_to_five_minutes():
     class S:
         sched = {'claude': {'fails': 0}}
+        states = {'claude': L.ProviderState()}
     for fails, secs in ((0, 5), (1, 10), (2, 20), (5, 160), (6, 300), (50, 300)):
         S.sched['claude']['fails'] = fails
         assert A.App.interval(S, 'claude') == secs
+    S.sched['claude']['fails'] = 0
+    S.states['claude'].missing = L.NOT_INSTALLED
+    assert A.App.interval(S, 'claude') == 300  # not installed or signed out: a slow check, so it comes back
 
 
 def test_update_shows_only_when_newer(fake_checks, monkeypatch):
@@ -289,6 +352,24 @@ def test_menu_rebuild_waits_while_the_menu_is_open(monkeypatch):
     assert built == [1]  # rebuilt once it closed
     icon._on_rebuild_menu(0, 0)
     assert built == [1, 1]
+
+
+def test_tray_icon_hidden_before_its_loop_starts_stays_hidden(monkeypatch):
+    icon = A.TrayIcon(9, 'ai-usage-test', A.draw.render_tray('1', 'ok', 'claude', 16), 'test',
+                      A.Menu(A.MenuItem('Close', lambda: None)))
+    calls = []
+    for name in ('_show', '_hide', '_update_icon'):
+        monkeypatch.setattr(icon, name, lambda name=name: calls.append(name))
+    icon.show(False)  # before the icon's loop runs: only remembered
+    assert calls == [] and not icon.visible
+    icon._running = True
+    icon.show()  # what run()'s setup does once the loop is ready: the last wish, not a stale True
+    assert calls == [] and not icon.visible
+    icon.show(True)
+    assert icon.visible and calls[-1] == '_show'
+    icon.show(False)
+    assert not icon.visible and calls[-1] == '_hide'
+    icon._running = False  # its loop never ran: nothing to stop when it is collected
 
 
 def test_check_for_updates_by_hand(fake_checks, monkeypatch):
@@ -401,7 +482,15 @@ CODEX_RESETS = [L.Reset('codex', 'codex', 'Codex reset', 'Refills your Codex lim
 
 
 def click(app, name):
-    x0, y0, x1, y1 = app.hits[name]
+    """Click a window hit by name. A 'use:' button lives on the hover card: a click on that provider's first bar
+    opens the card first (a no-op click when the button isn't there, like a click on a busy one)."""
+    if name.startswith('use:'):
+        bar = next(n for n in app.hits if n.startswith(f"bar:{name.split(':')[1]}:"))
+        if app.card_bar != bar or not app.card_open:
+            click(app, bar)
+        if name not in app.card_hits:
+            return
+    x0, y0, x1, y1 = app.card_hits.get(name) or app.hits[name]
     app.label.event_generate('<Button-1>', x=(x0 + x1) // 2, y=(y0 + y1) // 2)
 
 
@@ -431,13 +520,15 @@ def test_free_resets_show_and_spend(fake_checks, monkeypatch):
         app.q.put('open')
 
     def links_and_tooltip():
-        assert {'use:claude:weekly', 'use:claude:full', 'use:codex:codex'} <= set(app.hits)
         assert '3 free resets' in app.icons['claude'].title and '1 free reset\n' in app.icons['codex'].title
         assert answers['forced'][0] is False  # the automatic check doesn't force Anthropic
-        app.label.event_generate('<Motion>', x=sum(app.hits['use:claude:full'][::2]) // 2,
-                                 y=sum(app.hits['use:claude:full'][1::2]) // 2)
-        assert str(app.label.cget('cursor')) == 'hand2'
+        click(app, 'bar:claude:seven_day')
+        assert app.card_open and {'use:claude:weekly', 'use:claude:full'} <= set(app.card_hits)
+        app.label.event_generate('<Motion>', x=sum(app.card_hits['use:claude:full'][::2]) // 2,
+                                 y=sum(app.card_hits['use:claude:full'][1::2]) // 2)
+        assert str(app.label.cget('cursor')) == 'hand2' and app.hover == 'use:claude:full'
         click(app, 'use:claude:full')
+        assert not app.card_open  # like T3, the card closes before the question
 
     def said_no():
         title, message, parent = asked[0]
@@ -449,8 +540,10 @@ def test_free_resets_show_and_spend(fake_checks, monkeypatch):
 
     def spending():
         assert spent == [('claude', 'full', 'g2')] and app.spending == 'claude'
-        assert app.notes() == {'claude': 'Using a reset…'} and 'use:claude:full' not in app.hits
-        click(app, 'use:codex:codex')  # a second click while the first runs does nothing
+        assert app.notes() == {'claude': 'Using a reset…'}
+        click(app, 'bar:claude:seven_day')
+        assert app.card_open and not any(k.startswith('use:') for k in app.card_hits)  # its buttons say "Using…"
+        click(app, 'use:codex:codex')  # a second spend while the first runs does nothing
         assert len(asked) == 2 and spent == [('claude', 'full', 'g2')]
         answers['resets']['claude'][:] = CLAUDE_RESETS[:1]  # Anthropic now reports one kind fewer
         gate.set()
@@ -459,10 +552,11 @@ def test_free_resets_show_and_spend(fake_checks, monkeypatch):
         assert app.spending is None and app.reset_notes == {'claude': 'Reset used'}
         assert calls['claude'] == 2 and answers['forced'][-1] is False  # limits asked again, no extra forced read
         assert [r.kind for r in app.states['claude'].resets] == ['weekly']
-        assert 'use:claude:weekly' not in app.hits  # the note stands in for the links
+        click(app, 'bar:claude:seven_day')
+        assert set(k for k in app.card_hits if k.startswith('use:')) == {'use:claude:weekly'}
 
     def note_gone():
-        assert app.reset_notes == {} and 'use:claude:weekly' in app.hits
+        assert app.reset_notes == {}
 
     drive(app, [(1500, shown), (500, links_and_tooltip), (300, said_no), (300, spending), (700, outcome),
                 (1500, note_gone)])
@@ -589,7 +683,8 @@ def test_retry_keeps_key_and_grant_until_settled_and_old_checks_dont_restore(fak
         app.states['claude'].resets = L.without_one(answers['resets']['claude'], 'weekly')  # what is left now
         # a check that began before the spend comes back with the old list: it doesn't bring the used one back
         app.recheck.add('claude')
-        app.handle(('result', 'claude', answers['claude'](), None, time.time(), 0.1, list(answers['resets']['claude'])))
+        app.handle(('result', 'claude', answers['claude'](), None, time.time(), 0.1, list(answers['resets']['claude']), None,
+                    None))
         assert [r.count for r in app.states['claude'].resets] == [1]
 
     drive(app, [(1500, first), (800, again), (800, again), (800, done)])
@@ -732,3 +827,77 @@ def test_minimized_during_a_check_stops_the_spin(fake_checks, monkeypatch):
         assert not app.spinning and not app.anim.running and app.anim.job is None
 
     drive(app, [(1500, shown), (500, click_then_minimize), (2000, stopped)])
+
+
+def move(app, x, y):
+    app.label.event_generate('<Motion>', x=x, y=y)
+
+
+def test_hover_card_opens_on_a_resting_mouse_stays_on_the_way_and_closes_after(fake_checks, monkeypatch):
+    """T3's hover card: the mouse rests on a bar and the card opens; it stays while the mouse crosses the gap and
+    sits on the card; it closes a moment after the mouse leaves both; a click elsewhere or the X closes it too."""
+    _, answers, _ = fake_checks
+    answers['resets']['codex'][:] = CODEX_RESETS
+    monkeypatch.setattr(A.anim, 'motion_on', lambda: True)
+    app = A.App(start_hidden=True)
+    bar = 'bar:codex:codex:secondary'
+    at = {}
+
+    def shown():
+        app.q.put('open')
+
+    def rest_on_bar():
+        assert app.states['codex'].account == WHO  # the fake check said who is signed in
+        x0, y0, x1, y1 = app.hits[bar]
+        move(app, (x0 + x1) // 2, (y0 + y1) // 2)
+        assert str(app.label.cget('cursor')) == 'hand2' and not app.card_open  # not yet: the mouse must rest
+
+    def opened():
+        assert app.card_open and app.card_bar == bar and app.anim.value('card') == 1.0  # faded in by now
+        cx0, cy0, cx1, cy1 = at['card'] = app.card_hits['card']
+        bx0, by0, bx1, by1 = app.hits[bar]
+        assert cy1 < by0 and cx0 < (bx0 + bx1) // 2 < cx1  # above its bar, centered on it like T3
+        assert 'email' in app.card_hits and 'use:codex:codex' in app.card_hits
+        move(app, (bx0 + bx1) // 2, (cy1 + by0) // 2)  # the gap between bar and card
+        move(app, (cx0 + cx1) // 2, (cy0 + cy1) // 2)  # onto the card
+
+    def still_open_on_the_card():
+        assert app.card_open and 'close' not in app.card_jobs
+        app.label.event_generate('<Button-1>', x=sum(app.card_hits['email'][::2]) // 2,
+                                 y=sum(app.card_hits['email'][1::2]) // 2)
+        assert app.reveal and app.card_open  # a click on the email shows it; the card stays
+        move(app, 2, app.root.winfo_height() - 2)  # off the card and its bar
+
+    def closed():
+        assert not app.card_open and app.card_bar is None and app.card_hits == {}
+        assert not app.anim.running and app.anim.job is None  # nothing keeps running once it is gone
+        app.label.event_generate('<Button-1>', **center(app, bar))  # a click opens it at once
+        assert app.card_open and not app.reveal  # the email is hidden again on a new opening
+        app.label.event_generate('<Button-1>', **center(app, 'settings'))  # a click elsewhere closes it
+
+    def clicked_away():
+        assert not app.card_open
+        app.label.event_generate('<Button-1>', **center(app, bar))
+        app.hide_window()  # the X
+        assert not app.card_open and app.card_bar is None and app.anim.value('card') == 0.0
+
+    drive(app, [(1500, shown), (500, rest_on_bar), (A.CARD_OPEN_MS + 400, opened), (A.CARD_CLOSE_MS + 200,
+                still_open_on_the_card), (A.CARD_CLOSE_MS + 500, closed), (400, clicked_away)])
+
+
+def test_hover_card_moves_between_bars_and_shows_at_once_without_motion(fake_checks, monkeypatch):
+    monkeypatch.setattr(A.anim, 'motion_on', lambda: False)
+    app = A.App(start_hidden=True)
+
+    def shown():
+        app.q.put('open')
+
+    def open_one():
+        app.label.event_generate('<Button-1>', **center(app, 'bar:codex:codex:secondary'))
+        assert app.card_open and app.anim.value('card') == 1.0 and not app.anim.running  # no fade with motion off
+        first = app.card_hits['card']
+        move(app, **center(app, 'bar:claude:seven_day'))  # straight to another bar the card doesn't cover
+        assert app.card_bar == 'bar:claude:seven_day' and app.card_hits['card'] != first
+        assert 'email' not in app.card_hits  # the fake Claude says nothing about the account: no email line
+
+    drive(app, [(1500, shown), (500, open_one)])

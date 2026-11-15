@@ -145,10 +145,27 @@ def test_left_rounds():
     assert L.left_pct(row(30.4, 60), NOW) == 70 and L.left_pct(row(30.6, 60), NOW) == 69
 
 
+WEEKLY = {'utilization': 30, 'resets_at': '2030-01-08T12:00:00Z'}
+SONNET = {'display_name': 'Sonnet', 'utilization': 90, 'resets_at': '2030-01-08T12:00:00Z'}
+
+
+@pytest.mark.parametrize('rate_limits, key', [
+    ({'five_hour': {'utilization': 40}, 'seven_day': WEEKLY, 'model_scoped': [SONNET]}, 'five_hour'),  # Pro, Max
+    ({'five_hour': None, 'seven_day': WEEKLY, 'model_scoped': [SONNET]}, 'seven_day'),  # Ultra: weekly only
+    ({'seven_day': WEEKLY}, 'seven_day'),
+    ({'five_hour': {'utilization': 40}}, 'five_hour'),
+    ({'model_scoped': [SONNET]}, None),  # a model's own weekly limit never takes the tray
+])
+def test_claude_tray_is_the_5_hour_limit_else_the_weekly_one(rate_limits, key):
+    row = L.tray_row('claude', L.parse_claude(claude_payload(**rate_limits)))
+    assert (row and row.key) == key
+
+
 def test_tray_rows():
     claude = [L.Row('seven_day_sonnet', 'Weekly · Sonnet', 12), L.Row('seven_day', 'Weekly', 30)]
     assert L.tray_row('claude', claude).key == 'seven_day'
     assert L.tray_row('claude', claude[:1]) is None
+    assert L.tray_row('claude', [L.Row('five_hour', 'Session', 60)] + claude).key == 'five_hour'
     codex = [L.Row('codex:secondary', 'Weekly', 60, None, 10080), L.Row('codex:primary', 'Session', 80, None, 300)]
     assert L.tray_row('codex', codex).key == 'codex:primary'
     assert L.tray_row('codex', codex[:1]).key == 'codex:secondary'
@@ -169,10 +186,77 @@ def test_tooltip_before_first_check():
     assert L.tooltip('Codex', L.ProviderState(), NOW) == 'Codex · checking…'
 
 
+def test_tooltip_when_missing():
+    st = L.ProviderState(error='no answer in 25 s', missing=L.NOT_SIGNED_IN)
+    assert L.tooltip('Claude Code', st, NOW) == 'Claude Code · not signed in'
+
+
 def test_state_round_trip():
     st = L.ProviderState([row(5, 60)], NOW, 'oops')
     back = L.ProviderState.from_json(json.loads(json.dumps(st.to_json())))
-    assert back.rows == st.rows and back.checked_at == NOW and back.error is None
+    assert back.rows == st.rows and back.checked_at == NOW and back.error is None and back.missing is None
+    gone = L.ProviderState.from_json(json.loads(json.dumps(L.ProviderState(missing=L.NOT_INSTALLED).to_json())))
+    assert gone.missing == 'Not installed'
+    with pytest.raises(TypeError):
+        L.ProviderState.from_json({'rows': [], 'missing': 'gone fishing'})
+
+
+# ---------- not installed / not signed in ----------
+# What the real CLIs answered on a clean Windows PC with no login (Claude Code 2.1.325, codex-cli 0.169.0).
+
+SIGNED_OUT_USAGE = {'session': {}, 'subscription_type': None, 'rate_limits_available': False, 'rate_limits': None}
+FAKE_CLAUDE = '''
+    import json, sys
+    account = json.loads(sys.argv[1])
+    for line in sys.stdin:
+        m = json.loads(line)
+        rid = m['request_id']
+        body = {'commands': [], 'account': account} if rid == 'init' else json.loads(sys.argv[2])
+        print(json.dumps({'type': 'control_response',
+                          'response': {'subtype': 'success', 'request_id': rid, 'response': body}}), flush=True)
+'''
+
+
+@pytest.mark.parametrize('account, usage, signed_out', [
+    ({'tokenSource': 'none', 'apiProvider': 'firstParty'}, SIGNED_OUT_USAGE, True),  # the real signed-out answer
+    ({'tokenSource': 'none', 'apiKeySource': 'ANTHROPIC_API_KEY', 'apiProvider': 'firstParty'}, SIGNED_OUT_USAGE, False),
+    ({'tokenSource': 'none', 'apiProvider': 'bedrock'}, SIGNED_OUT_USAGE, False),
+    ({'tokenSource': 'claude.ai', 'apiProvider': 'firstParty'}, SIGNED_OUT_USAGE, False),
+    ({'tokenSource': 'none', 'apiProvider': 'firstParty'}, claude_payload(seven_day=WEEKLY), False),
+])
+def test_claude_signed_out_is_unavailable_other_logins_are_not(tmp_path, monkeypatch, account, usage, signed_out):
+    script = tmp_path / 'fake_claude.py'
+    script.write_text(textwrap.dedent(FAKE_CLAUDE), encoding='utf-8')
+    s = L.Session([sys.executable, '-u', str(script), json.dumps(account), json.dumps(usage)], L.CLAUDE.hello,
+                  greet=L.CLAUDE.greet)
+    monkeypatch.setattr(L, 'CLAUDE', s)
+    try:
+        if signed_out:
+            with pytest.raises(L.Unavailable, match='^Not signed in$'):
+                L.fetch_claude()
+        elif usage is SIGNED_OUT_USAGE:  # an API key or Bedrock login: signed in, with no plan limits
+            with pytest.raises(L.ProbeError, match='no limits for this login') as e:
+                L.fetch_claude()
+            assert not isinstance(e.value, L.Unavailable)
+        else:
+            assert L.tray_row('claude', L.fetch_claude()).key == 'seven_day'
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize('answer, unavailable', [
+    ({'id': 7, 'error': {'code': -32600, 'message': 'codex account authentication required to read rate limits'}}, True),
+    ({'id': 7, 'error': {'code': -32600, 'message': 'chatgpt authentication required to read rate limits'}}, False),
+    (L.ProbeError('no answer in 25 s'), False),
+    (L.ProbeError('closed without answering'), False),
+    ({'id': 7, 'error': {'message': 'network error'}}, False),
+])
+def test_codex_signed_out_is_unavailable_failures_are_not(monkeypatch, answer, unavailable):
+    monkeypatch.setattr(L, 'CODEX', FakeCodex(answer))
+    with pytest.raises(L.ProbeError) as e:
+        L.fetch_codex()
+    assert isinstance(e.value, L.Unavailable) == unavailable
+    assert (str(e.value) == 'Not signed in') == unavailable
 
 
 # ---------- talking to a CLI (fake ones) ----------
@@ -439,9 +523,9 @@ def test_close_ends_children_a_cli_leaves_behind(tmp_path):
 def test_fetch_reports_missing_cli(monkeypatch):
     monkeypatch.setattr(L.shutil, 'which', lambda name: None)
     L.close_all()
-    with pytest.raises(L.ProbeError, match='Claude Code not found'):
+    with pytest.raises(L.Unavailable, match='Not installed'):
         L.fetch_claude()
-    with pytest.raises(L.ProbeError, match='Codex not found'):
+    with pytest.raises(L.Unavailable, match='Not installed'):
         L.fetch_codex()
 
 
@@ -495,7 +579,7 @@ def test_cli_lookup_skips_current_folder(monkeypatch, tmp_path):
     monkeypatch.setenv('PATH', str(tmp_path / 'empty'))
     monkeypatch.setenv('PATHEXT', '.EXE;.BAT;.CMD')
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(L.ProbeError, match='Claude Code not found'):
+    with pytest.raises(L.Unavailable, match='Not installed'):
         L._claude_exe()
 
 
@@ -559,12 +643,9 @@ def test_claude_resets_several_kinds():
     assert rs[3].description == 'Refills your 5-hour and weekly limits.'
 
 
-def test_resets_line_and_tooltip():
+def test_resets_tooltip():
     rs = [L.Reset('claude', 'weekly', 'Weekly reset', '', 1, 1_900_000_000.0),
           L.Reset('claude', 'full', 'Full reset', '', 1, NOW - 5)]
-    line = L.resets_line(rs, NOW)
-    assert line.startswith('Free resets: 2 · Weekly reset ×1, Full reset ×1 · first expires ')
-    assert L.resets_line([], NOW) is None
     st = L.ProviderState([row(5, 60)], NOW, resets=rs)
     assert L.tooltip('Claude Code', st, NOW).split('\n')[1] == '2 free resets'
     assert 'free reset' not in L.tooltip('Claude Code', L.ProviderState([row(5, 60)], NOW), NOW)
@@ -803,3 +884,83 @@ def test_used_claude_reset_leaves_the_cache_even_when_asking_again_fails(claude_
     assert L.use_reset(L.Reset('claude', 'weekly', 'Weekly reset', '', 2, None, 'g1'), 'req_1') == 'reset'
     assert [r.count for r in L._claude_resets['value']] == [1]
     assert L.without_one(L._claude_resets['value'], 'weekly') == []
+
+
+# ---------- the hover card: times, plan names and who is signed in ----------
+
+def test_span_and_when_read_like_t3():
+    from datetime import datetime
+    assert [L.span(s) for s in (0, 59, 27 * 60 + 30, 3720, 5 * 86400 + 9 * 3600)] == ['0m', '0m', '27m', '1h 2m', '5d 9h']
+    now = datetime(2026, 11, 15, 8, 20).timestamp()
+    at = lambda *a: datetime(*a).timestamp()
+    assert L.when(at(2026, 11, 15, 14, 5), now) == '2:05 PM'
+    assert L.when(at(2026, 11, 16, 2, 23), now) == 'tomorrow at 2:23 AM'
+    assert L.when(at(2026, 11, 14, 23, 0), now) == 'yesterday at 11:00 PM'
+    assert L.when(at(2026, 11, 19, 22, 0), now) == '11/19 10:00 PM'
+    assert L.when(at(2027, 1, 2, 9, 0), now) == '1/2/2027 9:00 AM'
+
+
+@pytest.mark.parametrize('sub, plan', [
+    ('max', 'Claude Max Subscription'), ('pro', 'Claude Pro Subscription'), ('team', 'Claude Team Subscription'),
+    ('claude_max_20x_subscription', 'Claude Ultra Subscription'), ('Claude Max Subscription', 'Claude Max Subscription'),
+    ('some_new_tier', 'Claude Some New Tier Subscription'), (None, None), ('  ', None), (5, None),
+])
+def test_claude_plan_names_like_t3(sub, plan):
+    assert L.claude_plan(sub) == plan
+
+
+def test_codex_plan_names_like_t3():
+    assert L.codex_plan('plus') == 'ChatGPT Plus Subscription' and L.codex_plan('pro') == 'ChatGPT Pro 200 Subscription'
+    assert L.codex_plan('mystery') is None and L.codex_plan(None) is None  # never a guess
+
+
+@pytest.mark.parametrize('account, who', [
+    ({'email': ' you@example.com ', 'subscriptionType': 'max', 'tokenSource': 'claude.ai'},
+     {'email': 'you@example.com', 'plan': 'Claude Max Subscription'}),
+    ({'tokenSource': 'claude.ai'}, {'email': None, 'plan': None}),  # fields it can't get stay out of the card
+    ({'email': 7, 'subscriptionType': ''}, {'email': None, 'plan': None}),
+    (None, None), ('junk', None),
+])
+def test_claude_who(account, who):
+    assert L.claude_who(account) == who
+
+
+CHATGPT = {'account': {'type': 'chatgpt', 'email': 'you@example.com', 'planType': 'plus'}, 'requiresOpenaiAuth': True}
+
+
+@pytest.mark.parametrize('read, result, who', [
+    (CHATGPT, {'rateLimits': {'planType': 'pro'}}, {'email': 'you@example.com', 'plan': 'ChatGPT Pro 200 Subscription'}),
+    (CHATGPT, {'rateLimits': {'planType': 'unknown'}}, {'email': 'you@example.com', 'plan': 'ChatGPT Plus Subscription'}),
+    (CHATGPT, {}, {'email': 'you@example.com', 'plan': 'ChatGPT Plus Subscription'}),
+    ({'account': {'type': 'chatgpt'}}, {'rateLimits': {'planType': 'mystery'}}, {'email': None, 'plan': None}),
+    ({'account': {'type': 'apiKey'}}, {}, None),  # an API key: no person, no plan
+    ({'account': None}, {}, None), (None, {}, None), ('junk', None, None),
+])
+def test_codex_who(read, result, who):
+    assert L.codex_who(read, result) == who
+
+
+def test_codex_greeting_is_the_account_read_answer():
+    assert L.CODEX.greet({'id': 'account', 'result': CHATGPT}) == CHATGPT
+    assert L.CODEX.greet({'id': 2, 'result': {'rateLimits': {}}}) is None  # a check's answer, not the greeting
+    assert L.CODEX.greet({'id': 'account', 'error': {'message': 'unknown method'}}) is None  # an older Codex
+
+
+def test_claude_greeting_gives_email_and_plan(tmp_path, monkeypatch):
+    script = tmp_path / 'fake_claude.py'
+    script.write_text(textwrap.dedent(FAKE_CLAUDE), encoding='utf-8')
+    account = {'tokenSource': 'claude.ai', 'apiProvider': 'firstParty', 'email': 'you@example.com',
+               'subscriptionType': 'max'}
+    s = L.Session([sys.executable, '-u', str(script), json.dumps(account), json.dumps(claude_payload(seven_day=WEEKLY))],
+                  L.CLAUDE.hello, greet=L.CLAUDE.greet)
+    monkeypatch.setattr(L, 'CLAUDE', s)
+    try:
+        L.fetch_claude()
+        assert L.claude_who(s.greeting()) == {'email': 'you@example.com', 'plan': 'Claude Max Subscription'}
+    finally:
+        s.close()
+
+
+def test_who_is_never_saved():
+    st = L.ProviderState([row(5, 60)], NOW, account={'email': 'you@example.com', 'plan': 'Claude Max Subscription'})
+    assert 'account' not in st.to_json() and 'you@example.com' not in repr(st)

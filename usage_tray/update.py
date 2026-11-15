@@ -1,11 +1,13 @@
 """Update check against GitHub Releases, and the one-click update (runs get.ps1 in a visible PowerShell window)."""
 import json
 import logging
+import math
 import os
 import re
 import ssl
 import subprocess
 import tempfile
+import time
 import urllib.request
 
 import truststore
@@ -53,6 +55,26 @@ def check(api=API, current=__version__, strict=False):
     global offered
     offered = tag
     return tag
+
+
+def busy_until(e):
+    """When GitHub refused a check for too many asks (60 an hour per internet address without a sign-in), the
+    epoch second its count refills, else None."""
+    h = getattr(e, 'headers', None)
+    if getattr(e, 'code', None) not in (403, 429) or h is None:
+        return None
+    times = []
+    for ok, value in ((h.get('x-ratelimit-remaining') == '0', lambda: float(h['x-ratelimit-reset'])),
+                      (bool(h.get('retry-after')), lambda: time.time() + float(h['retry-after']))):
+        try:
+            if ok:
+                times.append(value())
+        except (TypeError, ValueError):
+            pass
+    now = time.time()
+    # a time that is not a real one, or more than a day away, would break the clock text and leave the button stuck
+    times = [t for t in times if math.isfinite(t) and now - 60 <= t <= now + 86400]
+    return max(times, default=None)  # both given: the later one, as GitHub asks
 
 
 CREATE_NEW_CONSOLE = 0x00000010
