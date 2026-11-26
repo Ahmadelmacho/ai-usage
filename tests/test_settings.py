@@ -12,7 +12,7 @@ def test_missing_file_gives_defaults(tmp_path):
 def test_save_then_load(tmp_path):
     path = str(tmp_path / 'settings.json')
     S.save(path, {'theme': 'light', 'claude': '#112233', 'codex': '#aabbcc'})
-    assert S.load(path) == {'theme': 'light', 'claude': '#112233', 'codex': '#aabbcc'}
+    assert S.load(path) == {**S.DEFAULTS, 'theme': 'light', 'claude': '#112233', 'codex': '#aabbcc'}
     assert not (tmp_path / 'settings.json.tmp').exists()
 
 
@@ -24,7 +24,7 @@ def test_broken_file_gives_defaults(tmp_path, content):
 
 def test_each_bad_value_falls_back_alone(tmp_path):
     (tmp_path / 's.json').write_text(json.dumps({'theme': 'pink', 'claude': '#ABCDEF', 'codex': 'red'}))
-    assert S.load(str(tmp_path / 's.json')) == {'theme': 'dark', 'claude': '#abcdef', 'codex': S.DEFAULTS['codex']}
+    assert S.load(str(tmp_path / 's.json')) == {**S.DEFAULTS, 'claude': '#abcdef'}
     (tmp_path / 's.json').write_text(json.dumps({'theme': 'system', 'claude': '#12345', 'codex': ['#123456']}))
     assert S.load(str(tmp_path / 's.json')) == {**S.DEFAULTS, 'theme': 'system'}
 

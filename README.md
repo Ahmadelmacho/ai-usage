@@ -36,6 +36,21 @@ The app looks for a new release a minute after it starts and every 6 hours after
 - It checks every 5 seconds. When a check fails, it keeps showing the last good numbers and tries again a little later.
 - Free resets: when Claude or Codex gives you free limit resets, each bar shows how many you have, and the hover card shows each kind and when it expires. Each kind has a **Use** button (**Use reset** for Codex). It asks "Use a … reset?" first, because a used reset can't be given back.
 
+## Hub accounts (optional)
+
+If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) with more than one Claude or Codex account, the app can show all of them. If you don't, skip this part: the app works as before.
+
+1. Open Settings (the gear in the window, or **Settings…** in the tray menu).
+2. Under **Hub**, type the hub address, such as `http://localhost:8317`.
+3. Paste the hub's management key and click **Save**.
+
+- Each limit gets one bar for each account, side by side. Hover a bar for that account's card.
+- The big number and the tray number are the average left across the accounts. The tray uses a limit that every account has.
+- The app asks the hub every 5 minutes, and at once on Refresh. When one account can't be read, the window says so. That account keeps its last numbers until its reset time.
+- A provider with no account on the hub keeps showing the login on this PC.
+- Free resets don't show for hub accounts.
+- **Remove** takes the hub out again.
+
 ## What it looks like
 
 <img src="docs/screenshots/tray.png" width="190" alt="A dark taskbar with 94 in orange and 100 in white next to the clock">
@@ -58,6 +73,7 @@ The pictures are drawn from made-up numbers with `python docs/screenshots/make.p
 - For `~/.codex/auth.json` it looks only at the time the file changed, to notice a new login.
 - From `~/.claude.json` it reads three values: your account id, your organization id (for a Claude reset) and the usage numbers Claude saved.
 - Your email and plan come from answers the two programs already give (see below). The app shows them only in the window. It never saves, logs or sends them.
+- With a hub: the app saves the hub address and the management key in `%LOCALAPPDATA%\AIUsage\settings.json`. Windows locks the key to your Windows login (DPAPI), so the file never holds it as plain text. The app sends the key only to the hub address you typed. It never sees the accounts' own logins: the hub puts them into each usage call. Use an `https` address, or a hub on this PC or your private network, because `http` sends the key unprotected.
 - It sends no prompts, so it spends no tokens.
 - It keeps the last numbers and a log in `%LOCALAPPDATA%\AIUsage`. The log can hold error text from the CLIs, so read it before you share it.
 
@@ -69,6 +85,7 @@ It asks your own signed-in `claude` and `codex` programs, the same way [T3 Code]
 - Codex: `codex app-server`, then the documented methods `account/rateLimits/read` and `account/read` (for the email).
 - Claude free resets: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1`, at most every 5 minutes. **Use** sends `POST /api/organizations/<your org>/reset_rate_limits`. Anthropic doesn't document these calls either.
 - Codex free resets come in the `account/rateLimits/read` answer. **Use reset** sends `account/rateLimitResetCredit/consume`.
+- Hub: `GET <hub>/v0/management/auth-files` lists the accounts. For each one, `POST <hub>/v0/management/api-call` has the hub ask `https://api.anthropic.com/api/oauth/usage` or `https://chatgpt.com/backend-api/wham/usage` with that account's login.
 
 Both programs stay running between checks, with plugins and auto-updates off. The app restarts them every 30 minutes, after a failed check, and when you switch accounts. When the app quits, they quit too.
 

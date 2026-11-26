@@ -203,6 +203,7 @@ SECTION_GAP = 32  # between providers
 LINE_H = 22  # the "Couldn't check" / old-numbers line above the cards
 STATUS_H = 28  # a 12 gap, then a reset's note ("Using a reset…") under the cards
 BAR_X, BAR_Y, BAR_H = 217, 31, 32  # where a card's bar starts, its top and height (T3: 11rem column, gap 24)
+BAR_GAP, BAR_CHIP_MIN = 6, 96
 NAMES = {'codex': 'Codex', 'claude': 'Claude'}
 
 
@@ -236,7 +237,7 @@ def _bar(p, x0, y0, x1, y1, row, provider, now, left=None, banked=0):
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, bw - 1, bh - 1], radius=round(6 * k), fill=255)
     p.img.paste(bar, (math.floor(p.X(x0) + 0.5), math.floor(p.Y(y0) + 0.5)), mask)
     cd = L.countdown(row, now)
-    if not cd and not banked:
+    if (not cd and not banked) or x1 - x0 < BAR_CHIP_MIN:
         return
     f, fb, fs = font('segoeui.ttf', 11 * k), font('seguisb.ttf', 11 * k), font('seguisym.ttf', 11 * k)
     first = f' {cd}' if cd else ''  # after a ↻ (Segoe UI has none; Segoe UI Symbol does)
@@ -260,7 +261,14 @@ def _bar(p, x0, y0, x1, y1, row, provider, now, left=None, banked=0):
         p.text(x + 14, cy, num, fb, TEXT, anchor='lm')
 
 
-def _card(p, x0, y0, x1, row, provider, now, left=None, banked=0):
+def account_bars(x0, x1, accounts, key):
+    gap = BAR_GAP if (x1 - x0) / len(accounts) >= 4 * BAR_GAP else 0
+    w = (x1 - x0 - gap * (len(accounts) - 1)) / len(accounts)
+    return [(x0 + i * (w + gap), x0 + i * (w + gap) + w, i, r)
+            for i, a in enumerate(accounts) for r in a.rows if r.key == key]
+
+
+def _card(p, x0, y0, x1, row, provider, now, left=None, banked=0, bars=None):
     """left: the % left to show while it glides to a new value (None: the row's own)."""
     k = p.k
     p.rrect(x0, y0, x1, y0 + CARD_H, 8, outline=BORDER)
@@ -272,6 +280,10 @@ def _card(p, x0, y0, x1, row, provider, now, left=None, banked=0):
     lx = x0 + 17 + p.width(pct, big) + 8
     small = font('segoeui.ttf', 14 * k)
     p.text(lx, base, 'left', small, MUTED, anchor='ls')
+    if bars is not None:
+        for ax0, ax1, _, own in bars:
+            _bar(p, ax0, y0 + BAR_Y, ax1, y0 + BAR_Y + BAR_H, own, provider, now)
+        return
     kind = L.pace(row, now)
     if kind:
         pace_icon(p, lx + p.width('left', small) + 8, base - 12, 14, kind, MUTED)
@@ -424,10 +436,14 @@ def _render_content(states, now, width, scale, busy, update, check, notes, fx, p
             banked = sum(r.count for r in st.resets)
             for row in st.rows:
                 key = f'card:{prov}:{row.key}'
+                bars = account_bars(PAD + BAR_X, width - PAD - 17, st.accounts, row.key) if st.accounts else None
                 part((PAD, y, width - PAD, y + CARD_H), (key,),
-                     lambda q, fx, y=y, row=row, key=key, prov=prov, banked=banked: _card(
-                         q, PAD, y, width - PAD, row, prov, now, fx.get(key), banked))
-                hits[f'bar:{prov}:{row.key}'] = (PAD + BAR_X, y + BAR_Y, width - PAD - 17, y + BAR_Y + BAR_H)
+                     lambda q, fx, y=y, row=row, key=key, prov=prov, banked=banked, bars=bars: _card(
+                         q, PAD, y, width - PAD, row, prov, now, fx.get(key), banked, bars))
+                if bars is None:
+                    hits[f'bar:{prov}:{row.key}'] = (PAD + BAR_X, y + BAR_Y, width - PAD - 17, y + BAR_Y + BAR_H)
+                for ax0, ax1, slot, _ in bars or ():
+                    hits[f'bar:{prov}:{row.key}@{slot}'] = (ax0, y + BAR_Y, ax1, y + BAR_Y + BAR_H)
                 y += CARD_H + CARD_GAP
             y -= CARD_GAP
         else:

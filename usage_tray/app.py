@@ -192,6 +192,8 @@ class App:
         self.check_note = None  # "Up to date (vX)" / "Couldn't check" for NOTE_MS after that check
         self.note_job = None
         self.prefs = S.load(SETTINGS)
+        self.hub = self.hub_note = self._hub_url = self._hub_key = None
+        self.load_hub()
         self.light = None  # the palette in use; apply_theme() sets it below
         self.settings_win = None
         self.spending = None  # the provider whose reset is being spent; a second "Use" click waits for it
@@ -292,9 +294,13 @@ class App:
             self.update_ui()
 
     def _check(self, p, force=False):
-        t0 = time.time()
+        t0, hub = time.time(), self.hub
         try:
-            if p == 'claude':
+            accounts, sent_at, err = L.hub_accounts(*hub, p, force) if hub else ([], None, None)
+            if accounts:
+                (L.CLAUDE if p == 'claude' else L.CODEX).close()
+                rows, resets, who = L.pool(accounts, time.time()), [], None
+            elif p == 'claude':
                 # Claude may answer with numbers Anthropic sent a while ago: keep their real time (None = unknown)
                 rows, sent_at = L.fetch_claude_dated()
                 resets = self._claude_resets(force)
@@ -302,17 +308,17 @@ class App:
             else:
                 rows, resets, who = fetch_codex()
                 sent_at = time.time()
-            self.q.put(('result', p, rows, None, sent_at, time.time() - t0, resets, None, who))
+            self.q.put(('result', p, rows, err, sent_at, time.time() - t0, resets, None, who, accounts, hub))
         except L.Unavailable as e:
             log.info('%s: %s', p, e)
-            self.q.put(('result', p, None, None, time.time(), time.time() - t0, None, str(e), None))
+            self.q.put(('result', p, None, None, time.time(), time.time() - t0, None, str(e), None, [], hub))
         except L.ProbeError as e:
             log.warning('%s check failed: %s', p, e)
-            self.q.put(('result', p, None, str(e), time.time(), time.time() - t0, None, None, None))
+            self.q.put(('result', p, None, str(e), time.time(), time.time() - t0, None, None, None, [], hub))
         except Exception:
             log.exception('%s check crashed', p)
             self.q.put(('result', p, None, 'unexpected error (see app.log)', time.time(), time.time() - t0, None, None,
-                        None))
+                        None, [], hub))
 
     @staticmethod
     def _claude_resets(force):
@@ -415,14 +421,20 @@ class App:
                 self.recheck.add(p)
             self.refresh(manual=True, only=[p], force=False)  # the Claude spend already asked its resets again
         elif msg[0] == 'result':
-            _, p, rows, err, ts, secs, resets, missing, who = msg
+            _, p, rows, err, ts, secs, resets, missing, who, *more = msg
+            accounts, source = more or ([], self.hub)
             st, s, c = self.states[p], self.sched[p], self.counts[p]
+            if source != self.hub:
+                s['busy'] = False
+                self.refresh(manual=self.manual, only=[p])
+                return
             if missing:  # not installed or signed out: its old numbers and resets go, the card says why
                 st.rows, st.resets, st.checked_at, st.error, st.missing = [], [], None, None, missing
-                st.account = None
+                st.account, st.accounts = None, []
             elif rows is not None:
-                st.rows, st.checked_at, st.error = rows, L.numbers_time(st, rows, ts, time.time()), None
+                st.rows, st.checked_at, st.error = rows, L.numbers_time(st, rows, ts, time.time()), err
                 st.missing, st.account = None, who
+                st.accounts = accounts
             else:
                 st.error = err
             if resets is not None and p not in self.recheck:  # a check begun before a spend has old resets
@@ -510,10 +522,13 @@ class App:
         now = self.last_ui = time.time()
         n = tray_size()
         gone = {p for p, st in self.states.items() if st.missing}
+        for st in self.states.values():
+            if st.accounts:
+                st.rows = L.pool(st.accounts, now)
         for p, ic in self.icons.items():
             ic.show(p not in gone or (p == 'claude' and gone == set(self.icons)))  # one stays, so the app can be opened
             st = self.states[p]
-            row = L.tray_row(p, st.rows)
+            row = L.tray_row(p, st.rows, st.accounts)
             left = L.left_pct(row, now) if row else None
             look = (str(left), L.level(left), n, self.prefs[p]) if row else ('–', 'none', n, self.prefs[p])
             if self.shown.get(p) != look:
@@ -542,7 +557,8 @@ class App:
         shown = [(L.left_pct(r, now), L.countdown(r, now), L.pace(r, now))  # what each row shows right now
                  for st in self.states.values() for r in st.rows]
         content_h = self.content_height(now, notes, s)
-        sig = (repr([(st.rows, st.error, st.missing, L.stale(st, now)) for st in self.states.values()]), shown,
+        sig = (repr([(st.rows, st.error, st.missing, L.stale(st, now), st.accounts) for st in self.states.values()]),
+               shown,
                [st.checked_at and L.clock(st.checked_at) for st in self.states.values()], busy, w, h, s, int(now // 60),
                self.update_tag, self.check_text(), repr([st.resets for st in self.states.values()]), notes, content_h)
         fx = self.fx()
@@ -835,11 +851,17 @@ class App:
         """(patch, top-left, hits) of the card over the window picture now; drawn again only when it changed.
         None when its row is gone."""
         _, p, key = self.card_bar.split(':', 2)
-        st = self.states[p]
+        st, host = self.states[p], HOST
+        key, _, slot = key.partition('@')
+        if slot:
+            if not self.hub or int(slot) >= len(st.accounts):
+                return None
+            own = st.accounts[int(slot)]
+            st, host = L.ProviderState(rows=own.rows, account=own.who), L.hub_base(self.hub[0]).split('://', 1)[1]
         row = next((r for r in st.rows if r.key == key), None)
         if self.card_bar not in self.hits or row is None or st.missing:
             return None
-        m = draw.card_model(p, st, row, time.time(), HOST, busy=self.spending == p)
+        m = draw.card_model(p, st, row, time.time(), host, busy=self.spending == p)
         fx = {n: self.anim.value(n, 0.0) for r in st.resets for n in (f'use:{p}:{r.kind}', f'use:{p}:{r.kind}!')}
         sig = (self.card_bar, repr(m), self.reveal, tuple(fx.items()), self.hits[self.card_bar], self.screen_ver)
         if not self.card_cache or self.card_cache[0] != sig:
@@ -956,6 +978,37 @@ class App:
         if self.settings_open():
             self.root.after_idle(self.fill_settings)  # not now: the clicked button is still in its own handler
 
+    def load_hub(self):
+        url, key = self.prefs['hub_url'], S.unlock(self.prefs['hub_key'])
+        self.hub = (url, key) if L.hub_base(url) and key else None
+
+    def save_hub(self, remove=False):
+        url, key = ('', '') if remove else (self._hub_url.get().strip(), self._hub_key.get().strip())
+        self.hub_note = None
+        if not remove and not L.hub_base(url):
+            self.hub_note = 'The address must start with http:// or https://'
+        elif not remove and not key and not self.hub:
+            self.hub_note = "Paste the hub's management key"
+        else:
+            try:
+                self.prefs['hub_key'] = '' if remove else S.lock(key) if key else self.prefs['hub_key']
+            except OSError:
+                log.exception('could not lock the hub key')
+                self.hub_note = "Windows couldn't save the key"
+        if self.hub_note:
+            self.root.after_idle(self.fill_settings)
+            return
+        self.prefs['hub_url'] = url
+        self.load_hub()
+        self.hub_note = 'Hub removed' if remove else 'Saved.' + (
+            ' http sends the key unprotected. Use it only on your own network.' if L.hub_unprotected(url) else '')
+        self._hub_url = self._hub_key = None
+        if not self.hub:
+            for st in self.states.values():
+                st.accounts = []
+        self.set_pref('hub_url', url)
+        self.refresh(manual=True)
+
     def pick_color(self, p):
         _, color = colorchooser.askcolor(self.prefs[p], parent=self.settings_win, title=f'{NAMES[p]} number color')
         if color:
@@ -969,6 +1022,7 @@ class App:
             self.settings_win = tk.Toplevel(self.root)
             self.settings_win.title(f'{APP} settings')
             self.settings_win.resizable(False, False)
+            self.hub_note = self._hub_url = self._hub_key = None
             self.fill_settings()
         top = self.settings_win
         top.deiconify()
@@ -1015,6 +1069,21 @@ class App:
                      highlightbackground=edge).grid(row=row, column=1, padx=(0, 4))
             button('Change…', lambda p=p: self.pick_color(p), row, 2)
             button('Reset', lambda p=p: self.set_pref(p, S.DEFAULTS[p]), row, 3)
+        label('Hub (optional)', 7, head, pady=(14, 0))
+        tk.Label(top, text='Show every account of a CLIProxyAPI hub.', bg=bg, fg=draw.MUTED,
+                 font=body).grid(row=8, column=0, columnspan=4, sticky='w', pady=(0, 4))
+        self._hub_url = tk.StringVar(top, self._hub_url.get() if self._hub_url else self.prefs['hub_url'])
+        self._hub_key = tk.StringVar(top, self._hub_key.get() if self._hub_key else '')
+        for i, (text, var, show) in enumerate((('Address', self._hub_url, ''), ('Management key', self._hub_key, '•'))):
+            tk.Label(top, text=text, bg=bg, fg=fg, font=body).grid(row=9 + i, column=0, sticky='w', padx=(0, 14))
+            tk.Entry(top, textvariable=var, show=show, width=30, bg=control, fg=fg, insertbackground=fg, relief='flat',
+                     highlightthickness=1, highlightbackground=edge, highlightcolor=fg,
+                     font=body).grid(row=9 + i, column=1, columnspan=3, sticky='we', pady=3, ipady=2)
+        button('Save', self.save_hub, 11, 2)
+        button('Remove', lambda: self.save_hub(remove=True), 11, 3)
+        tk.Label(top, text=self.hub_note or ('Key saved. Leave the key box empty to keep it.' if self.hub else ''),
+                 bg=bg, fg=draw.MUTED, font=body, wraplength=340, justify='left').grid(row=12, column=0, columnspan=4,
+                                                                                    sticky='w')
         top.update_idletasks()
         self.title_bar(user32.GetParent(top.winfo_id()))
 

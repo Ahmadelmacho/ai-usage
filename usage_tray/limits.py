@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -51,6 +52,13 @@ class Row:
 
 
 @dataclass
+class Account:
+    rows: list[Row] = field(default_factory=list)
+    who: dict | None = field(default=None, repr=False, compare=False)
+    id: str | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass
 class ProviderState:
     rows: list[Row] = field(default_factory=list)
     checked_at: float | None = None  # last successful check
@@ -59,6 +67,7 @@ class ProviderState:
     missing: str | None = None  # 'Not installed' / 'Not signed in' (see Unavailable) until a check works again
     # {'email', 'plan'} for the hover card (claude_who / codex_who): in memory only, never saved, logged or shown in repr
     account: dict | None = field(default=None, repr=False, compare=False)
+    accounts: list[Account] = field(default_factory=list)
 
     def to_json(self):
         return {'rows': [asdict(r) for r in self.rows], 'checked_at': self.checked_at,
@@ -728,12 +737,16 @@ STALE_SECS = 120  # numbers older than this show their own time ("numbers from 3
 
 
 def stale(state, now):
-    return bool(state.rows and state.checked_at and not state.error and now - state.checked_at > STALE_SECS)
+    return bool(state.rows and state.checked_at and not state.error and not state.accounts
+                and now - state.checked_at > STALE_SECS)
 
 
-def tray_row(provider, rows):
+def tray_row(provider, rows, accounts=()):
     """Claude icon = the 5-hour (Session) limit, or the weekly one when the plan has no 5-hour limit (Ultra);
-    Codex icon = 5-hour limit of the main Codex limit, else its first one."""
+    Codex icon = 5-hour limit of the main Codex limit, else its first one.
+    Hub accounts: only a limit that every account has can be the icon's."""
+    if accounts:
+        rows = [r for r in rows if all(any(x.key == r.key for x in a.rows) for a in accounts)] or rows
     if provider == 'claude':
         keys = {r.key: r for r in rows}
         return keys.get('five_hour') or keys.get('seven_day')
@@ -1057,3 +1070,182 @@ def without_one(resets, kind):
     """The list with one reset of this kind taken away."""
     return [r if r.kind != kind else Reset(**{**vars(r), 'count': r.count - 1})
             for r in resets if r.kind != kind or r.count > 1]
+
+
+HUB_READ_SECS = 300
+HUB_AGAIN_SECS = 10
+HUB_MAX_BYTES = 1 << 20
+HUB_USAGE = {'claude': ANTHROPIC + '/api/oauth/usage', 'codex': 'https://chatgpt.com/backend-api/wham/usage'}
+HUB_ASKED = {'claude': 'Anthropic', 'codex': 'OpenAI'}
+_hub = {'source': None, 'at': None, 'value': {}, 'errors': {}, 'failed': None, 'lock': threading.Lock()}
+
+
+class HubRefused(ProbeError):
+    pass
+
+
+def hub_base(url):
+    try:
+        u = urllib.parse.urlsplit(url.strip())
+        host = u.hostname
+    except (ValueError, AttributeError):
+        return None
+    if u.scheme not in ('http', 'https') or not host or u.username or u.password:
+        return None
+    return f"{u.scheme}://{u.netloc}{re.sub(r'(/management[.]html)?/*$', '', u.path, flags=re.I)}"
+
+
+def pool(accounts, now):
+    same = {}
+    for a in accounts:
+        for r in a.rows:
+            same.setdefault(r.key, []).append(r)
+    rows = []
+    for key, group in same.items():
+        ahead = [r.resets_at for r in group if r.resets_at is not None and r.resets_at > now]
+        rows.append(Row(key, group[0].label, sum(used_now(r, now) for r in group) / len(group),
+                        min(ahead) if ahead else None, group[0].window_mins))
+    return sorted(rows, key=lambda r: r.window_mins or math.inf)
+
+
+def _hub_call(base, key, path, body=None):
+    req = urllib.request.Request(f'{base}/v0/management/{path}',
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={'authorization': f'Bearer {key}', 'content-type': 'application/json'})
+    try:
+        with _urlopen(req, 20) as r:
+            raw = r.read(HUB_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        code = e.code
+        e.close()
+        if code in (401, 403):
+            raise HubRefused('the hub refused the management key') from None
+        raise ProbeError(f'the hub answered {code}') from None
+    except Exception:  # noqa: BLE001
+        raise ProbeError('the hub did not answer') from None
+    finally:
+        req = None
+    try:
+        if len(raw) > HUB_MAX_BYTES:
+            raise ValueError
+        return json.loads(raw)
+    except ValueError:
+        raise ProbeError('the hub answer was not understood') from None
+
+
+def hub_claude_rows(body):
+    scoped = []
+    for limit in body.get('limits') or []:
+        scope = limit.get('scope') if isinstance(limit, dict) and limit.get('kind') == 'weekly_scoped' else None
+        model = scope.get('model') if isinstance(scope, dict) else None
+        if isinstance(model, dict):
+            scoped.append({'display_name': model.get('display_name'), 'utilization': limit.get('percent'),
+                           'resets_at': limit.get('resets_at')})
+    return parse_claude({'rate_limits_available': True, 'rate_limits': {
+        **{k: body.get(k) for k in ('five_hour', 'seven_day', 'spend', 'extra_usage')}, 'model_scoped': scoped}})
+
+
+def hub_codex_rows(body):
+    limit = body.get('rate_limit')
+    rows = []
+    for slot in ('primary_window', 'secondary_window'):
+        w = limit.get(slot) if isinstance(limit, dict) else None
+        if isinstance(w, dict) and _num(w.get('used_percent')) is not None:
+            secs = _num(w.get('limit_window_seconds'))
+            mins = round(secs / 60) if secs and secs >= 60 else None
+            rows.append(Row(f'codex:{mins or slot}', _window_label(mins), _clamp(w['used_percent']),
+                            _num(w.get('reset_at')), mins))
+    if not rows:
+        raise ProbeError('no limits for this login')
+    return rows
+
+
+def _hub_account(base, key, provider, f):
+    token = f.get('id_token') if isinstance(f.get('id_token'), dict) else {}
+    header = {'Authorization': 'Bearer $TOKEN$', 'Content-Type': 'application/json'}
+    if provider == 'claude':
+        header.update({'anthropic-beta': 'oauth-2025-04-20',
+                       'User-Agent': f"claude-cli/{_claude_version() or '2.1.280'} (external, cli)"})
+    else:
+        header.update({'OpenAI-Beta': 'codex-1', 'Originator': 'Codex Desktop'})
+        if _text(token.get('chatgpt_account_id')):
+            header['Chatgpt-Account-Id'] = token['chatgpt_account_id'].strip()
+    answer = _hub_call(base, key, 'api-call', {'auth_index': f.get('auth_index'), 'method': 'GET',
+                                              'url': HUB_USAGE[provider], 'header': header})
+    status = answer.get('status_code') if isinstance(answer, dict) else None
+    if status != 200:
+        said = status if isinstance(status, int) else 'nothing'
+        raise ProbeError(f'{HUB_ASKED[provider]} answered {said} through the hub')
+    body = answer.get('body')
+    try:
+        body = json.loads(body) if isinstance(body, str) else body
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise ProbeError('the hub answer was not understood')
+    if provider == 'claude':
+        return Account(hub_claude_rows(body), {'email': _text(f.get('email')), 'plan': None})
+    plans = (body.get('plan_type'), token.get('plan_type'), token.get('chatgpt_plan_type'))
+    return Account(hub_codex_rows(body), {'email': _text(f.get('email')),
+                                          'plan': next((codex_plan(v) for v in plans if codex_plan(v)), None)})
+
+
+def _hub_read(base, key, old):
+    listed = _hub_call(base, key, 'auth-files')
+    files = listed.get('files') if isinstance(listed, dict) else None
+    if not isinstance(files, list):
+        raise ProbeError('the hub answer was not understood')
+    files = [f for f in files if isinstance(f, dict) and f.get('provider') in HUB_USAGE and not f.get('disabled')]
+    _claude_version()
+
+    def read(f):
+        try:
+            return _hub_account(base, key, f['provider'], f)
+        except ProbeError as e:
+            return e
+    with ThreadPoolExecutor(4) as workers:
+        answers = list(workers.map(read, files))
+    value, errors, now = {}, {}, time.time()
+    for f, account in zip(files, answers):
+        provider, fid = f['provider'], f.get('id') or f.get('name')
+        if isinstance(account, ProbeError):
+            log.info('hub: a %s account: %s', provider, account)
+            errors.setdefault(provider, str(account))
+            account = next((a for a in old.get(provider, []) if fid is not None and a.id == fid
+                            and not any(r.resets_at is not None and r.resets_at <= now for r in a.rows)), None)
+            if account is None:
+                continue
+        account.id = fid
+        value.setdefault(provider, []).append(account)
+    return value, errors
+
+
+def hub_unprotected(url):
+    u = urllib.parse.urlsplit(hub_base(url))
+    return u.scheme == 'http' and u.hostname not in ('localhost', '127.0.0.1', '::1')
+
+
+def hub_accounts(url, key, provider, force=False):
+    base = hub_base(url)
+    if not base or not key:
+        raise ProbeError('the hub address or key is missing')
+    c = _hub
+    with c['lock']:
+        now = time.time()
+        if c['source'] != (base, key):
+            c.update(source=(base, key), at=None, value={}, errors={}, failed=None)
+        fresh = lambda at, hold: now - at < HUB_AGAIN_SECS or (not force and now - at < hold)
+        if c['failed'] and fresh(*c['failed'][1:]):
+            raise type(c['failed'][0])(str(c['failed'][0]))
+        if c['at'] is None or not fresh(c['at'], HUB_READ_SECS):
+            try:
+                c['value'], c['errors'] = _hub_read(base, key, c['value'])
+            except ProbeError as e:
+                c['at'] = None
+                c['failed'] = (e, time.time(), HUB_READ_SECS if isinstance(e, HubRefused) else HUB_AGAIN_SECS)
+                raise
+            c['at'], c['failed'] = time.time(), None
+        accounts, error = list(c['value'].get(provider, [])), c['errors'].get(provider)
+        if error and not accounts:
+            raise ProbeError(error)
+        return accounts, c['at'], error
